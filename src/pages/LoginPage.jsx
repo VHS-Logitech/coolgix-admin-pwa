@@ -41,7 +41,7 @@ export default function LoginPage({ onLoggedIn }) {
       if (err.code === 'ERR_NETWORK' || err.message === 'Network Error') {
         msg = import.meta.env.DEV
           ? 'Cannot reach the API. Start the Coolgix backend (default port 5000). In dev, /api is proxied — set VITE_DEV_PROXY_TARGET in coolgix-pwa-dashboard/.env if your API uses another host/port. For a remote API in dev, set VITE_DEV_USE_REMOTE_API.'
-          : 'Cannot reach the API. Rebuild with the correct VITE_API_URL, or check that the server is up.';
+          : 'Cannot reach the API. On Vercel, remove VITE_API_URL so /api uses the host rewrite (see vercel.json). Otherwise set VITE_API_URL only if that origin is allowed by the API CORS config.';
       }
       setError(msg);
     } finally {

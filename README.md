@@ -20,7 +20,9 @@ Create `.env` in **this folder** (`coolgix-pwa-dashboard/`) only if you need non
 
 ### Production build
 
-Set **`VITE_API_URL`** to your deployed API origin when you run `npm run build` (see `.env.example`).
+- **Vercel (and any host that can reverse-proxy `/api`):** leave **`VITE_API_URL` unset**. The built app calls **`/api/...` on the same origin**; this repo’s `vercel.json` forwards that to `https://v2.coolgix.com`, so the browser never cross-origin calls the API and **CORS does not apply**. In the Vercel dashboard, **remove** `VITE_API_URL` if it was set, then redeploy.
+- **Why `VITE_API_URL=https://v2.coolgix.com` fails on Vercel:** the API responds with `Access-Control-Allow-Origin: https://v2.coolgix.com` only. Your page is on `https://coolgix-admin-pwa.vercel.app`, so the browser blocks the response unless the API is updated to allow that origin (or you use the proxy pattern above).
+- **Other static hosting:** set **`VITE_API_URL`** only if that host’s URL is already allowed by the backend CORS configuration.
 
 ## Dev
 
