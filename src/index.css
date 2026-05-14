@@ -1,0 +1,45 @@
+/** Align with main web app ThemeContext.jsx */
+:root {
+  --cg-primary: #7551ff;
+  --cg-secondary: #39b8ff;
+  --cg-bg: #121212;
+  --cg-surface: #1e1e1e;
+  --cg-surface-2: #2a2a2a;
+  --cg-text: #f3f4f6;
+  --cg-muted: #9ca3af;
+  --cg-success: #22c55e;
+  --cg-warning: #f59e0b;
+  --cg-danger: #ef4444;
+  --cg-radius: 16px;
+  --cg-shadow: 0 2px 12px rgba(112, 144, 176, 0.12);
+}
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+body {
+  font-family: Inter, Roboto, system-ui, -apple-system, sans-serif;
+  background: var(--cg-bg);
+  color: var(--cg-text);
+  -webkit-font-smoothing: antialiased;
+}
+
+button,
+input,
+select {
+  font: inherit;
+}
+
+a {
+  color: var(--cg-secondary);
+}
