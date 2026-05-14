@@ -661,9 +661,6 @@ export default function DashboardPage({ onLogout }) {
             ))}
           </select>
         </label>
-        <button type="button" className="btn-secondary" onClick={() => loadBleHealth()} disabled={loading}>
-          {loading ? '…' : 'Refresh'}
-        </button>
       </section>
 
       <section className="legend-row">
@@ -830,15 +827,6 @@ export default function DashboardPage({ onLogout }) {
           padding: 0.45rem 0.75rem;
           border-radius: 10px;
           cursor: pointer;
-        }
-        .btn-secondary {
-          background: rgba(117, 81, 255, 0.2);
-          border: 1px solid rgba(117, 81, 255, 0.45);
-          color: #e9e7ff;
-          padding: 0.55rem 0.9rem;
-          border-radius: 12px;
-          cursor: pointer;
-          align-self: flex-end;
         }
         .banner-error {
           background: rgba(239, 68, 68, 0.12);
