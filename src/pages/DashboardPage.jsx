@@ -13,22 +13,15 @@ import {
 } from 'chart.js';
 import { axios, unwrap, setAuthToken } from '../api.js';
 import { clearSession, getToken, getUser } from '../session.js';
-import {
-  getTemperature,
-  getHumidity,
-  getTimestamp,
-  latestFromReadings,
-  getTempAgg,
-  getHumAgg,
-} from '../sensorHelpers.js';
+import { latestFromReadings } from '../sensorHelpers.js';
 import {
   getBrowserTimeZone,
   getCurrentHourUtcWindow,
   buildUtcRangeForDate,
   getCalendarYmdInTimeZone,
   addCalendarDaysToYmd,
-  formatTimeInTimezone,
 } from '../timeWindow.js';
+import { buildClimateChartLabels, buildMultiSeriesUniform } from '../climateChartMulti.js';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
@@ -105,64 +98,13 @@ async function mapPool(items, concurrency, mapper) {
   return results;
 }
 
-/**
- * One-minute uniform grid + forward sample within step (same projection as Dashboard buildMultiSeriesUniform).
- */
-function projectBleToClimateGrid(readings, startMs, endMs, stepMs, timeZone, labelMode) {
-  const sorted = (readings || [])
-    .filter(Boolean)
-    .slice()
-    .sort((a, b) => {
-      const ma = getTimestamp(a) ? new Date(getTimestamp(a)).getTime() : 0;
-      const mb = getTimestamp(b) ? new Date(getTimestamp(b)).getTime() : 0;
-      return ma - mb;
-    });
-
-  const labels = [];
-  const temps = [];
-  const hums = [];
-  const tempMeta = [];
-  const humMeta = [];
-  let rIdx = 0;
-  const getMs = (r) => {
-    const t = getTimestamp(r);
-    return t ? new Date(t).getTime() : 0;
-  };
-
-  for (let t = startMs; t <= endMs; t += stepMs) {
-    while (rIdx + 1 < sorted.length && getMs(sorted[rIdx + 1]) <= t) {
-      rIdx++;
-    }
-    let temp = null;
-    let hum = null;
-    let tm = null;
-    let hm = null;
-    if (sorted.length > 0) {
-      const ts = getMs(sorted[rIdx] || {});
-      if (ts > 0 && ts <= t && ts > t - stepMs) {
-        const r = sorted[rIdx];
-        const tv = getTemperature(r);
-        const hv = getHumidity(r);
-        temp = typeof tv === 'number' && !Number.isNaN(tv) ? tv : null;
-        hum = typeof hv === 'number' && !Number.isNaN(hv) ? hv : null;
-        tm = getTempAgg(r);
-        hm = getHumAgg(r);
-      }
-    }
-    labels.push(formatTimeInTimezone(t, timeZone, labelMode === 'live'));
-    temps.push(temp);
-    hums.push(hum);
-    tempMeta.push(tm);
-    humMeta.push(hm);
-  }
-
-  return { labels, temps, hums, tempMeta, humMeta };
-}
-
-function calculateYAxisRangeFromTemps(seriesTemps) {
+/** Smart °C axis from all plotted temperature values (matches web Dashboard). */
+function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
   const allTemps = [];
-  for (const v of seriesTemps || []) {
-    if (typeof v === 'number' && !Number.isNaN(v)) allTemps.push(v);
+  for (const ds of multiTempSeries?.datasets || []) {
+    for (const value of ds.data || []) {
+      if (typeof value === 'number' && !Number.isNaN(value)) allTemps.push(value);
+    }
   }
   if (allTemps.length === 0) return null;
 
@@ -188,6 +130,19 @@ function calculateYAxisRangeFromTemps(seriesTemps) {
   let max = Math.ceil((maxTemp + padding) / spacing) * spacing;
   if (min < 0) min = 0;
 
+  if (roomConfiguration && roomConfiguration.temperature) {
+    const thresholdMin = roomConfiguration.temperature.min;
+    const thresholdMax = roomConfiguration.temperature.max;
+
+    if (typeof thresholdMin === 'number' && thresholdMin < min) {
+      min = Math.floor((thresholdMin - padding) / spacing) * spacing;
+      if (min < 0) min = 0;
+    }
+    if (typeof thresholdMax === 'number' && thresholdMax > max) {
+      max = Math.ceil((thresholdMax + padding) / spacing) * spacing;
+    }
+  }
+
   return { min, max, spacing };
 }
 
@@ -205,8 +160,11 @@ export default function DashboardPage({ onLogout }) {
   const [warehouseDoc, setWarehouseDoc] = useState(null);
   const [bles, setBles] = useState([]);
   const [bleSnapshots, setBleSnapshots] = useState({});
-  const [chartBleId, setChartBleId] = useState('');
-  const [chartReadings, setChartReadings] = useState([]);
+  const [warehouseStructure, setWarehouseStructure] = useState(null);
+  const [selectedRoom, setSelectedRoom] = useState('');
+  const [selectedSpot, setSelectedSpot] = useState('average');
+  const [bleReadingsMap, setBleReadingsMap] = useState({});
+  const [roomConfiguration, setRoomConfiguration] = useState(null);
   const [chartMode, setChartMode] = useState('24h');
   const [chartDate, setChartDate] = useState(() => getCalendarYmdInTimeZone(new Date(), getBrowserTimeZone()));
   const [loading, setLoading] = useState(false);
@@ -215,6 +173,64 @@ export default function DashboardPage({ onLogout }) {
   const [lastRefresh, setLastRefresh] = useState(null);
 
   const roomIndex = useMemo(() => buildRoomIndex(warehouseDoc), [warehouseDoc]);
+
+  const linkedRoomIdsForWarehouse = useMemo(() => {
+    if (!warehouseId) return new Set();
+    const set = new Set();
+    for (const d of bles || []) {
+      const wid = d?.warehouse?._id || d?.warehouse;
+      if (String(wid || '') !== String(warehouseId)) continue;
+      const rid = d?.room?._id || d?.room;
+      if (rid) set.add(String(rid));
+    }
+    return set;
+  }, [bles, warehouseId]);
+
+  const structureRoomsList = warehouseStructure?.rooms || [];
+  const spotsList = warehouseStructure?.spots || [];
+
+  const roomsList = useMemo(() => {
+    if (!warehouseId) return [];
+    const linked = linkedRoomIdsForWarehouse;
+    return (structureRoomsList || []).filter((r) => linked.has(String(r._id)));
+  }, [structureRoomsList, linkedRoomIdsForWarehouse, warehouseId]);
+
+  const roomIds = useMemo(() => new Set((roomsList || []).map((r) => String(r._id))), [roomsList]);
+  const safeSelectedRoom =
+    selectedRoom && roomIds.has(String(selectedRoom)) ? String(selectedRoom) : '';
+
+  const spotIdsForRoom = useMemo(
+    () =>
+      new Set(
+        (spotsList || []).filter((s) => String(s.roomId) === String(safeSelectedRoom)).map((s) => s._id),
+      ),
+    [spotsList, safeSelectedRoom],
+  );
+  const safeSelectedSpot =
+    selectedSpot === 'average' || (selectedSpot && spotIdsForRoom.has(selectedSpot))
+      ? selectedSpot
+      : 'average';
+
+  const visibleBleDevices = useMemo(() => {
+    let arr = bles || [];
+    if (warehouseId) {
+      arr = arr.filter((d) => String(d?.warehouse?._id || d?.warehouse || '') === String(warehouseId));
+    }
+    if (!safeSelectedRoom) return [];
+    arr = arr.filter((d) => {
+      const r = d?.room;
+      const rid = r && r._id ? r._id : r;
+      return String(rid || '') === String(safeSelectedRoom);
+    });
+    if (safeSelectedSpot && safeSelectedSpot !== 'average') {
+      arr = arr.filter((d) => {
+        const s = d?.spot;
+        const sid = s && s._id ? s._id : s;
+        return sid === safeSelectedSpot;
+      });
+    }
+    return arr;
+  }, [bles, warehouseId, safeSelectedRoom, safeSelectedSpot]);
 
   const chartTimeWindow = useMemo(() => {
     if (chartMode === '24h') {
@@ -231,66 +247,106 @@ export default function DashboardPage({ onLogout }) {
     setChartDate((prev) => (prev === today ? prev : today));
   }, [chartMode, browserTimeZone]);
 
-  const climateGrid = useMemo(
+  const climateChartLabels = useMemo(
     () =>
-      projectBleToClimateGrid(
-        chartReadings,
+      buildClimateChartLabels(
         chartTimeWindow.startMs,
         chartTimeWindow.endMs,
         CHART_STEP_MS,
         browserTimeZone,
-        chartMode,
+        chartMode === 'live',
       ),
-    [chartReadings, chartTimeWindow, browserTimeZone, chartMode],
+    [chartTimeWindow, browserTimeZone, chartMode],
   );
 
-  const yAxisRangeTemp = useMemo(() => calculateYAxisRangeFromTemps(climateGrid.temps), [climateGrid.temps]);
+  const tempThresholds =
+    roomConfiguration && roomConfiguration.temperature ? roomConfiguration.temperature : null;
+  const humThresholds = roomConfiguration && roomConfiguration.humidity ? roomConfiguration.humidity : null;
+
+  const multiTempSeries = useMemo(
+    () =>
+      buildMultiSeriesUniform(
+        visibleBleDevices,
+        bleReadingsMap,
+        chartTimeWindow.startMs,
+        chartTimeWindow.endMs,
+        CHART_STEP_MS,
+        [],
+        false,
+        tempThresholds,
+        warehouseStructure,
+        safeSelectedSpot,
+        chartMode,
+        browserTimeZone,
+        'temperature',
+        true,
+        climateChartLabels,
+      ),
+    [
+      visibleBleDevices,
+      bleReadingsMap,
+      chartTimeWindow,
+      climateChartLabels,
+      tempThresholds,
+      warehouseStructure,
+      safeSelectedSpot,
+      browserTimeZone,
+      chartMode,
+    ],
+  );
+
+  const multiHumSeries = useMemo(
+    () =>
+      buildMultiSeriesUniform(
+        visibleBleDevices,
+        bleReadingsMap,
+        chartTimeWindow.startMs,
+        chartTimeWindow.endMs,
+        CHART_STEP_MS,
+        [],
+        false,
+        humThresholds,
+        warehouseStructure,
+        safeSelectedSpot,
+        chartMode,
+        browserTimeZone,
+        'humidity',
+        true,
+        climateChartLabels,
+      ),
+    [
+      visibleBleDevices,
+      bleReadingsMap,
+      chartTimeWindow,
+      climateChartLabels,
+      humThresholds,
+      warehouseStructure,
+      safeSelectedSpot,
+      browserTimeZone,
+      chartMode,
+    ],
+  );
+
+  const combinedClimateChartData = useMemo(() => {
+    const temp = multiTempSeries;
+    const hum = multiHumSeries;
+    if (!temp?.labels?.length) return { labels: [], datasets: [] };
+    const tempDs = (temp.datasets || []).map((ds) => ({ ...ds, yAxisID: 'y' }));
+    const humDs = (hum?.datasets || []).map((ds) => ({
+      ...ds,
+      yAxisID: 'y1',
+      hidden: true,
+    }));
+    return { labels: temp.labels, datasets: [...tempDs, ...humDs] };
+  }, [multiTempSeries, multiHumSeries]);
+
+  const yAxisRangeTemp = useMemo(
+    () => computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration),
+    [multiTempSeries, roomConfiguration],
+  );
   const yAxisRangeHum = useMemo(() => ({ min: 0, max: 100, spacing: 20 }), []);
 
-  const chartData = useMemo(() => {
-    const { labels, temps, hums, tempMeta, humMeta } = climateGrid;
-    return {
-      labels,
-      datasets: [
-        {
-          label: 'Temperature (°C)',
-          yAxisID: 'y',
-          data: temps,
-          borderColor: '#7551FF',
-          backgroundColor: 'rgba(117, 81, 255, 0.12)',
-          tension: 0.3,
-          fill: true,
-          spanGaps: true,
-          pointRadius: 2,
-          pointHoverRadius: 5,
-          pointBackgroundColor: '#FFFFFF',
-          pointBorderColor: '#ebff9e',
-          pointBorderWidth: 2,
-          pointHitRadius: 8,
-          pointStyle: 'circle',
-          metaAgg: tempMeta,
-        },
-        {
-          label: 'Humidity (% RH)',
-          yAxisID: 'y1',
-          data: hums,
-          borderColor: '#1976D2',
-          backgroundColor: 'rgba(25, 118, 210, 0.08)',
-          tension: 0.3,
-          fill: false,
-          spanGaps: true,
-          pointRadius: 2,
-          pointHoverRadius: 5,
-          pointBackgroundColor: '#FFFFFF',
-          pointBorderColor: '#90caf9',
-          pointBorderWidth: 2,
-          pointHitRadius: 8,
-          hidden: true,
-          metaAgg: humMeta,
-        },
-      ],
-    };
-  }, [climateGrid]);
+  const chartData = combinedClimateChartData;
 
   const chartOptions = useMemo(
     () => ({
@@ -471,6 +527,76 @@ export default function DashboardPage({ onLogout }) {
     setWarehouseDoc(wh || null);
   }, [warehouseId, warehouses]);
 
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchStructure() {
+      if (!warehouseId) {
+        setWarehouseStructure(null);
+        return;
+      }
+      try {
+        const res = await axios.get(`/api/warehouses/${warehouseId}/structure`, { headers: authHeaders() });
+        if (!cancelled) setWarehouseStructure(res.data || null);
+      } catch {
+        if (!cancelled) setWarehouseStructure(null);
+      }
+    }
+    fetchStructure();
+    return () => {
+      cancelled = true;
+    };
+  }, [warehouseId]);
+
+  useEffect(() => {
+    if (!warehouseId) return;
+    if (roomsList.length > 0) {
+      setSelectedRoom((prev) => {
+        const p = prev ? String(prev) : '';
+        const next = p && roomIds.has(p) ? p : String(roomsList[0]._id);
+        if (next !== p) queueMicrotask(() => setSelectedSpot('average'));
+        return next;
+      });
+    } else {
+      setSelectedRoom('');
+      setSelectedSpot('average');
+    }
+  }, [warehouseId, roomIds, roomsList]);
+
+  useEffect(() => {
+    let cancelled = false;
+    async function fetchRoomConfiguration() {
+      if (!safeSelectedRoom || !warehouseId) {
+        setRoomConfiguration(null);
+        return;
+      }
+      try {
+        const res = await axios.get(`/api/warehouses/${warehouseId}`, { headers: authHeaders() });
+        if (cancelled) return;
+        const warehouse = res.data;
+        let roomConfig = null;
+        for (const floor of warehouse.floors || []) {
+          for (const room of floor.rooms || []) {
+            if (room._id === safeSelectedRoom) {
+              roomConfig = {
+                temperature: room.temperature || { min: null, max: null },
+                humidity: room.humidity || { min: null, max: null },
+              };
+              break;
+            }
+          }
+          if (roomConfig) break;
+        }
+        setRoomConfiguration(roomConfig);
+      } catch {
+        if (!cancelled) setRoomConfiguration(null);
+      }
+    }
+    fetchRoomConfiguration();
+    return () => {
+      cancelled = true;
+    };
+  }, [safeSelectedRoom, warehouseId]);
+
   const loadBleHealth = useCallback(async () => {
     const cid = companyId || defaultCompanyId;
     if (!cid || !warehouseId) {
@@ -505,12 +631,6 @@ export default function DashboardPage({ onLogout }) {
       const map = {};
       for (const [id, snap] of snaps) map[id] = snap;
       setBleSnapshots(map);
-
-      setChartBleId((prev) => {
-        if (prev && map[prev]) return prev;
-        const first = list[0]?._id;
-        return first ? String(first) : '';
-      });
     } catch (e) {
       setError(e.response?.data?.message || e.message || 'Failed to load devices');
     } finally {
@@ -531,29 +651,44 @@ export default function DashboardPage({ onLogout }) {
   }, [loadBleHealth]);
 
   const loadChart = useCallback(async () => {
-    if (!chartBleId) {
-      setChartReadings([]);
+    const ids = visibleBleDevices.map((d) => d._id);
+    if (!ids.length) {
+      setBleReadingsMap({});
+      setChartLoading(false);
       return;
     }
     setChartLoading(true);
     try {
       const { startIso, endIso } = chartTimeWindow;
-      const res = await axios.get(`/api/devices/${chartBleId}/sensor-data`, {
-        params: {
-          start: startIso,
-          end: endIso,
-          limit: 5000,
-        },
-        headers: authHeaders(),
+      const results = await Promise.allSettled(
+        ids.map((id) =>
+          axios.get(`/api/devices/${id}/sensor-data`, {
+            params: {
+              start: startIso,
+              end: endIso,
+              limit: 5000,
+            },
+            headers: authHeaders(),
+          }),
+        ),
+      );
+      const nextMap = {};
+      results.forEach((r, i) => {
+        const id = ids[i];
+        if (r.status === 'fulfilled') {
+          const data = Array.isArray(r.value.data) ? r.value.data : [];
+          nextMap[id] = data;
+        } else {
+          nextMap[id] = [];
+        }
       });
-      const readings = Array.isArray(res.data) ? res.data : [];
-      setChartReadings(readings);
+      setBleReadingsMap(nextMap);
     } catch {
-      setChartReadings([]);
+      setBleReadingsMap({});
     } finally {
       setChartLoading(false);
     }
-  }, [chartBleId, chartTimeWindow]);
+  }, [visibleBleDevices, chartTimeWindow]);
 
   useEffect(() => {
     loadChart();
@@ -609,9 +744,15 @@ export default function DashboardPage({ onLogout }) {
     return out;
   }, [roomsGrouped, roomIndex, bleSnapshots]);
 
-  const hasChartPoints =
-    climateGrid.temps.some((v) => typeof v === 'number') ||
-    climateGrid.hums.some((v) => typeof v === 'number');
+  const hasChartPoints = useMemo(() => {
+    const check = (series) => {
+      for (const ds of series?.datasets || []) {
+        if (ds.data?.some((v) => typeof v === 'number' && !Number.isNaN(v))) return true;
+      }
+      return false;
+    };
+    return check(multiTempSeries) || check(multiHumSeries);
+  }, [multiTempSeries, multiHumSeries]);
 
   return (
     <div className="dash">
@@ -639,6 +780,8 @@ export default function DashboardPage({ onLogout }) {
               onChange={(e) => {
                 setCompanyId(e.target.value);
                 setWarehouseId('');
+                setSelectedRoom('');
+                setSelectedSpot('average');
               }}
             >
               <option value="">Select company</option>
@@ -652,7 +795,15 @@ export default function DashboardPage({ onLogout }) {
         ) : null}
         <label className="select-wrap grow">
           <span>Warehouse</span>
-          <select value={warehouseId} onChange={(e) => setWarehouseId(e.target.value)} disabled={!warehouses.length}>
+          <select
+            value={warehouseId}
+            onChange={(e) => {
+              setWarehouseId(e.target.value);
+              setSelectedRoom('');
+              setSelectedSpot('average');
+            }}
+            disabled={!warehouses.length}
+          >
             <option value="">{warehouses.length ? 'Select warehouse' : 'No warehouses'}</option>
             {warehouses.map((w) => (
               <option key={w._id} value={w._id}>
@@ -711,14 +862,41 @@ export default function DashboardPage({ onLogout }) {
       <section className="chart-section">
         <div className="chart-head">
           <h2>Temperature &amp; humidity vs time</h2>
-          <select value={chartBleId} onChange={(e) => setChartBleId(e.target.value)} className="chart-select">
-            <option value="">Select sensor</option>
-            {bles.map((d) => (
-              <option key={d._id} value={String(d._id)}>
-                {d.name || d.macAddress || d._id}
-              </option>
-            ))}
-          </select>
+        </div>
+        <div className="chart-room-row">
+          <label className="select-wrap grow">
+            <span>Room</span>
+            <select
+              value={safeSelectedRoom}
+              onChange={(e) => {
+                setSelectedRoom(e.target.value);
+                setSelectedSpot('average');
+              }}
+              disabled={!roomsList.length}
+            >
+              <option value="">{roomsList.length ? 'Select room' : 'No mapped rooms'}</option>
+              {roomsList.map((r) => (
+                <option key={r._id} value={String(r._id)}>
+                  {r.name || r._id}
+                </option>
+              ))}
+            </select>
+          </label>
+          {safeSelectedRoom ? (
+            <label className="select-wrap grow">
+              <span>Spot</span>
+              <select value={safeSelectedSpot} onChange={(e) => setSelectedSpot(e.target.value)}>
+                <option value="average">Average</option>
+                {(spotsList || [])
+                  .filter((s) => String(s.roomId) === String(safeSelectedRoom))
+                  .map((s) => (
+                    <option key={s._id} value={String(s._id)}>
+                      {s.type || s.name || 'Spot'}
+                    </option>
+                  ))}
+              </select>
+            </label>
+          ) : null}
         </div>
         <div className="chart-controls">
           <div className="chart-date-row">
@@ -779,18 +957,24 @@ export default function DashboardPage({ onLogout }) {
           </div>
         </div>
         <p className="chart-hint">
-          Left axis = °C (auto-scaled with padding so the trace sits centered). Right = % RH (0–100). Humidity is off by
-          default — toggle it in the legend. X-axis: <strong>24h</strong> shows a label every 4 hours;{' '}
-          <strong>Live</strong> every 15 minutes.
+          One chart: <strong>left</strong> axis = °C, <strong>right</strong> = % RH. Only the first temperature line is
+          on by default; use the legend for other BLEs, room average, and humidity. X-axis: <strong>24h</strong> every 4
+          hours; <strong>Live</strong> every 15 minutes.
         </p>
         <div className="chart-box">
           {chartLoading ? (
             <div className="chart-loading">Loading chart…</div>
-          ) : chartBleId && hasChartPoints ? (
+          ) : visibleBleDevices.length > 0 && hasChartPoints ? (
             <Line data={chartData} options={chartOptions} />
           ) : (
             <div className="chart-loading">
-              {chartBleId ? 'No readings in this window.' : 'Select a sensor.'}
+              {!visibleBleDevices.length
+                ? safeSelectedRoom
+                  ? 'No BLE devices in this room/spot for the chart.'
+                  : roomsList.length === 0
+                    ? 'No rooms with linked BLEs in this warehouse.'
+                    : 'Select a room to load the chart.'
+                : 'No readings in this window.'}
             </div>
           )}
         </div>
@@ -1018,6 +1202,12 @@ export default function DashboardPage({ onLogout }) {
           margin: 0;
           font-size: 0.95rem;
           font-weight: 600;
+        }
+        .chart-room-row {
+          display: flex;
+          flex-wrap: wrap;
+          gap: 0.5rem;
+          margin-bottom: 0.5rem;
         }
         .chart-select {
           padding: 0.45rem 0.55rem;
