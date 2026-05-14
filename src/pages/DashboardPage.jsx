@@ -351,7 +351,7 @@ export default function DashboardPage({ onLogout }) {
                 if (match) {
                   const hour = parseInt(match[1], 10);
                   const minute = parseInt(match[2], 10);
-                  if (minute === 0 && hour % 2 === 0) return label;
+                  if (minute === 0 && hour % 4 === 0) return label;
                   return '';
                 }
               }
@@ -783,7 +783,7 @@ export default function DashboardPage({ onLogout }) {
         </div>
         <p className="chart-hint">
           Left axis = °C (auto-scaled with padding so the trace sits centered). Right = % RH (0–100). Humidity is off by
-          default — toggle it in the legend. X-axis: <strong>24h</strong> shows a label every 2 hours;{' '}
+          default — toggle it in the legend. X-axis: <strong>24h</strong> shows a label every 4 hours;{' '}
           <strong>Live</strong> every 15 minutes.
         </p>
         <div className="chart-box">
