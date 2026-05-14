@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from 'react';
+import { useCallback, useEffect, useLayoutEffect, useMemo, useState } from 'react';
 import { Line } from 'react-chartjs-2';
 import {
   Chart as ChartJS,
@@ -13,14 +13,29 @@ import {
 } from 'chart.js';
 import { axios, unwrap, setAuthToken } from '../api.js';
 import { clearSession, getToken, getUser } from '../session.js';
-import { getTemperature, getHumidity, getTimestamp, latestFromReadings } from '../sensorHelpers.js';
+import {
+  getTemperature,
+  getHumidity,
+  getTimestamp,
+  latestFromReadings,
+  getTempAgg,
+  getHumAgg,
+} from '../sensorHelpers.js';
+import {
+  getBrowserTimeZone,
+  getCurrentHourUtcWindow,
+  buildUtcRangeForDate,
+  getCalendarYmdInTimeZone,
+  addCalendarDaysToYmd,
+  formatTimeInTimezone,
+} from '../timeWindow.js';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
 const LIVE_MS = 5 * 60 * 1000;
 const STALE_MS = 2 * 60 * 60 * 1000;
-const CHART_HOURS = 24;
 const BLE_FETCH_CONCURRENCY = 6;
+const CHART_STEP_MS = 60 * 1000;
 
 function authHeaders() {
   const t = getToken();
@@ -90,10 +105,98 @@ async function mapPool(items, concurrency, mapper) {
   return results;
 }
 
+/**
+ * One-minute uniform grid + forward sample within step (same projection as Dashboard buildMultiSeriesUniform).
+ */
+function projectBleToClimateGrid(readings, startMs, endMs, stepMs, timeZone, labelMode) {
+  const sorted = (readings || [])
+    .filter(Boolean)
+    .slice()
+    .sort((a, b) => {
+      const ma = getTimestamp(a) ? new Date(getTimestamp(a)).getTime() : 0;
+      const mb = getTimestamp(b) ? new Date(getTimestamp(b)).getTime() : 0;
+      return ma - mb;
+    });
+
+  const labels = [];
+  const temps = [];
+  const hums = [];
+  const tempMeta = [];
+  const humMeta = [];
+  let rIdx = 0;
+  const getMs = (r) => {
+    const t = getTimestamp(r);
+    return t ? new Date(t).getTime() : 0;
+  };
+
+  for (let t = startMs; t <= endMs; t += stepMs) {
+    while (rIdx + 1 < sorted.length && getMs(sorted[rIdx + 1]) <= t) {
+      rIdx++;
+    }
+    let temp = null;
+    let hum = null;
+    let tm = null;
+    let hm = null;
+    if (sorted.length > 0) {
+      const ts = getMs(sorted[rIdx] || {});
+      if (ts > 0 && ts <= t && ts > t - stepMs) {
+        const r = sorted[rIdx];
+        const tv = getTemperature(r);
+        const hv = getHumidity(r);
+        temp = typeof tv === 'number' && !Number.isNaN(tv) ? tv : null;
+        hum = typeof hv === 'number' && !Number.isNaN(hv) ? hv : null;
+        tm = getTempAgg(r);
+        hm = getHumAgg(r);
+      }
+    }
+    labels.push(formatTimeInTimezone(t, timeZone, labelMode === 'live'));
+    temps.push(temp);
+    hums.push(hum);
+    tempMeta.push(tm);
+    humMeta.push(hm);
+  }
+
+  return { labels, temps, hums, tempMeta, humMeta };
+}
+
+function calculateYAxisRangeFromTemps(seriesTemps) {
+  const allTemps = [];
+  for (const v of seriesTemps || []) {
+    if (typeof v === 'number' && !Number.isNaN(v)) allTemps.push(v);
+  }
+  if (allTemps.length === 0) return null;
+
+  const minTemp = Math.min(...allTemps);
+  const maxTemp = Math.max(...allTemps);
+  const range = maxTemp - minTemp;
+
+  let spacing;
+  if (range <= 10) {
+    spacing = 5;
+  } else if (range <= 25) {
+    spacing = 5;
+  } else if (range <= 50) {
+    spacing = 10;
+  } else {
+    spacing = 20;
+  }
+
+  const paddingPercent = Math.max(0.1, Math.min(0.2, spacing / (range || 1)));
+  const padding = Math.max(spacing, range * paddingPercent);
+
+  let min = Math.max(0, Math.floor((minTemp - padding) / spacing) * spacing);
+  let max = Math.ceil((maxTemp + padding) / spacing) * spacing;
+  if (min < 0) min = 0;
+
+  return { min, max, spacing };
+}
+
 export default function DashboardPage({ onLogout }) {
   const user = getUser();
   const isSuperadmin = user?.role === 'superadmin';
   const defaultCompanyId = companyIdFromUser(user);
+
+  const browserTimeZone = useMemo(() => getBrowserTimeZone(), []);
 
   const [companies, setCompanies] = useState([]);
   const [companyId, setCompanyId] = useState(defaultCompanyId);
@@ -103,13 +206,218 @@ export default function DashboardPage({ onLogout }) {
   const [bles, setBles] = useState([]);
   const [bleSnapshots, setBleSnapshots] = useState({});
   const [chartBleId, setChartBleId] = useState('');
-  const [chartPoints, setChartPoints] = useState([]);
+  const [chartReadings, setChartReadings] = useState([]);
+  const [chartMode, setChartMode] = useState('24h');
+  const [chartDate, setChartDate] = useState(() => getCalendarYmdInTimeZone(new Date(), getBrowserTimeZone()));
   const [loading, setLoading] = useState(false);
   const [chartLoading, setChartLoading] = useState(false);
   const [error, setError] = useState('');
   const [lastRefresh, setLastRefresh] = useState(null);
 
   const roomIndex = useMemo(() => buildRoomIndex(warehouseDoc), [warehouseDoc]);
+
+  const chartTimeWindow = useMemo(() => {
+    if (chartMode === '24h') {
+      const range = buildUtcRangeForDate(chartDate, browserTimeZone);
+      return { startMs: range.startMs, endMs: range.endMs, startIso: range.startIso, endIso: range.endIso };
+    }
+    const w = getCurrentHourUtcWindow(browserTimeZone);
+    return { startMs: w.startMs, endMs: w.endMs, startIso: w.startIso, endIso: w.endIso };
+  }, [chartMode, chartDate, browserTimeZone]);
+
+  useLayoutEffect(() => {
+    if (chartMode !== 'live') return;
+    const today = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
+    setChartDate((prev) => (prev === today ? prev : today));
+  }, [chartMode, browserTimeZone]);
+
+  const climateGrid = useMemo(
+    () =>
+      projectBleToClimateGrid(
+        chartReadings,
+        chartTimeWindow.startMs,
+        chartTimeWindow.endMs,
+        CHART_STEP_MS,
+        browserTimeZone,
+        chartMode,
+      ),
+    [chartReadings, chartTimeWindow, browserTimeZone, chartMode],
+  );
+
+  const yAxisRangeTemp = useMemo(() => calculateYAxisRangeFromTemps(climateGrid.temps), [climateGrid.temps]);
+  const yAxisRangeHum = useMemo(() => ({ min: 0, max: 100, spacing: 20 }), []);
+
+  const chartData = useMemo(() => {
+    const { labels, temps, hums, tempMeta, humMeta } = climateGrid;
+    return {
+      labels,
+      datasets: [
+        {
+          label: 'Temperature (°C)',
+          yAxisID: 'y',
+          data: temps,
+          borderColor: '#7551FF',
+          backgroundColor: 'rgba(117, 81, 255, 0.12)',
+          tension: 0.3,
+          fill: true,
+          spanGaps: true,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+          pointBackgroundColor: '#FFFFFF',
+          pointBorderColor: '#ebff9e',
+          pointBorderWidth: 2,
+          pointHitRadius: 8,
+          pointStyle: 'circle',
+          metaAgg: tempMeta,
+        },
+        {
+          label: 'Humidity (% RH)',
+          yAxisID: 'y1',
+          data: hums,
+          borderColor: '#1976D2',
+          backgroundColor: 'rgba(25, 118, 210, 0.08)',
+          tension: 0.3,
+          fill: false,
+          spanGaps: true,
+          pointRadius: 2,
+          pointHoverRadius: 5,
+          pointBackgroundColor: '#FFFFFF',
+          pointBorderColor: '#90caf9',
+          pointBorderWidth: 2,
+          pointHitRadius: 8,
+          hidden: true,
+          metaAgg: humMeta,
+        },
+      ],
+    };
+  }, [climateGrid]);
+
+  const chartOptions = useMemo(
+    () => ({
+      responsive: true,
+      maintainAspectRatio: false,
+      interaction: { mode: 'index', intersect: false },
+      plugins: {
+        legend: { display: true },
+        title: { display: false },
+        tooltip: {
+          callbacks: {
+            label: (ctx) => {
+              const ds = ctx.dataset;
+              const idx = ctx.dataIndex;
+              const value = ctx.parsed?.y;
+              const info = Array.isArray(ds.metaAgg) ? ds.metaAgg[idx] : null;
+              const isHum = ds.yAxisID === 'y1';
+              const parts = [];
+              const f = (v) => (typeof v === 'number' ? (isHum ? Number(v).toFixed(1) : Number(v).toFixed(2)) : '-');
+              const uMin = isHum ? ' %RH' : ' °C';
+              const uAvg = isHum ? ' %RH' : ' °C';
+              if (info && typeof info === 'object') {
+                const min = typeof info.min === 'number' ? info.min : undefined;
+                const max = typeof info.max === 'number' ? info.max : undefined;
+                const avg =
+                  typeof info.avg === 'number' ? info.avg : typeof value === 'number' ? value : undefined;
+                parts.push(`Min: ${f(min)}${uMin}`, `Max: ${f(max)}${uMin}`, `Avg: ${f(avg)}${uAvg}`);
+              } else {
+                parts.push(`Avg: ${f(value)}${uAvg}`);
+              }
+              return parts;
+            },
+          },
+        },
+      },
+      scales: {
+        x: {
+          grid: { display: false, color: 'rgba(255,255,255,0.06)' },
+          ticks: {
+            autoSkip: false,
+            maxRotation: 0,
+            color: '#9ca3af',
+            callback(value, index, ticks) {
+              const label = this.getLabelForValue(value);
+              if (chartMode === 'live') {
+                const match = label.match(/^(\d{1,2}):(\d{2}):(\d{2})/);
+                if (match) {
+                  const hour = parseInt(match[1], 10);
+                  const minute = parseInt(match[2], 10);
+                  if (minute % 5 === 0) {
+                    return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+                  }
+                  return '';
+                }
+              } else if (chartMode === '24h') {
+                const match = label.match(/^(\d{1,2}):(\d{2})/);
+                if (match) {
+                  const hour = parseInt(match[1], 10);
+                  const minute = parseInt(match[2], 10);
+                  const visibleTicks = ticks.length;
+                  if (visibleTicks >= 600) {
+                    return minute === 0 && hour % 2 === 0 ? label : '';
+                  }
+                  if (visibleTicks >= 240) {
+                    return minute === 0 ? label : '';
+                  }
+                  if (visibleTicks >= 90) {
+                    return minute === 0 || minute === 30 ? label : '';
+                  }
+                  if (visibleTicks >= 45) {
+                    return minute % 15 === 0 ? label : '';
+                  }
+                  if (visibleTicks >= 25) {
+                    return minute % 5 === 0 ? label : '';
+                  }
+                  if (visibleTicks >= 12) {
+                    return minute % 2 === 0 ? label : '';
+                  }
+                  return label;
+                }
+              }
+              return label;
+            },
+          },
+        },
+        y: {
+          type: 'linear',
+          position: 'left',
+          title: { display: true, text: 'Temperature (°C)', color: '#9ca3af' },
+          grid: { color: 'rgba(200,200,200,0.12)' },
+          ticks: { color: '#9ca3af' },
+          ...(yAxisRangeTemp
+            ? {
+                min: yAxisRangeTemp.min,
+                max: yAxisRangeTemp.max,
+                ticks: {
+                  color: '#9ca3af',
+                  stepSize: yAxisRangeTemp.spacing,
+                  callback: (v) => `${v}°C`,
+                },
+              }
+            : {}),
+        },
+        y1: {
+          type: 'linear',
+          position: 'right',
+          title: { display: true, text: 'Humidity (% RH)', color: '#9ca3af' },
+          grid: { drawOnChartArea: false },
+          ticks: { color: '#9ca3af' },
+          ...(yAxisRangeHum
+            ? {
+                min: yAxisRangeHum.min,
+                max: yAxisRangeHum.max,
+                ticks: {
+                  color: '#9ca3af',
+                  stepSize: yAxisRangeHum.spacing,
+                  callback: (v) => `${v}%`,
+                },
+              }
+            : {}),
+        },
+      },
+    }),
+    [chartMode, yAxisRangeTemp, yAxisRangeHum],
+  );
+
+  const todayCalendarYmd = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
 
   const logout = useCallback(async () => {
     const t = getToken();
@@ -241,49 +549,50 @@ export default function DashboardPage({ onLogout }) {
 
   const loadChart = useCallback(async () => {
     if (!chartBleId) {
-      setChartPoints([]);
+      setChartReadings([]);
       return;
     }
     setChartLoading(true);
     try {
-      const end = new Date();
-      const start = new Date(end.getTime() - CHART_HOURS * 60 * 60 * 1000);
+      const { startIso, endIso } = chartTimeWindow;
       const res = await axios.get(`/api/devices/${chartBleId}/sensor-data`, {
         params: {
-          start: start.toISOString(),
-          end: end.toISOString(),
-          limit: 500,
+          start: startIso,
+          end: endIso,
+          limit: 5000,
         },
         headers: authHeaders(),
       });
       const readings = Array.isArray(res.data) ? res.data : [];
-      const sorted = readings
-        .filter(Boolean)
-        .slice()
-        .sort((a, b) => {
-          const ma = getTimestamp(a) ? new Date(getTimestamp(a)).getTime() : 0;
-          const mb = getTimestamp(b) ? new Date(getTimestamp(b)).getTime() : 0;
-          return ma - mb;
-        });
-      const maxPts = 200;
-      const step = Math.max(1, Math.ceil(sorted.length / maxPts));
-      const sampled = sorted.filter((_, i) => i % step === 0 || i === sorted.length - 1);
-      setChartPoints(
-        sampled.map((r) => ({
-          t: getTimestamp(r),
-          temp: getTemperature(r),
-        }))
-      );
+      setChartReadings(readings);
     } catch {
-      setChartPoints([]);
+      setChartReadings([]);
     } finally {
       setChartLoading(false);
     }
-  }, [chartBleId]);
+  }, [chartBleId, chartTimeWindow]);
 
   useEffect(() => {
     loadChart();
   }, [loadChart]);
+
+  const handleModeChange = (next) => {
+    if (next === chartMode) return;
+    setChartMode(next);
+    if (next === 'live') {
+      setChartDate(getCalendarYmdInTimeZone(new Date(), browserTimeZone));
+    }
+  };
+
+  const handleDateStep = (deltaDays) => {
+    const next = addCalendarDaysToYmd(chartDate, deltaDays, browserTimeZone);
+    const today = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
+    const clamped = next > today ? today : next;
+    setChartDate(clamped);
+    if (chartMode === 'live' && clamped !== today) {
+      setChartMode('24h');
+    }
+  };
 
   const roomsGrouped = useMemo(() => {
     const groups = new Map();
@@ -298,52 +607,28 @@ export default function DashboardPage({ onLogout }) {
   const roomCards = useMemo(() => {
     const out = [];
     for (const [roomKey, devices] of roomsGrouped.entries()) {
-      const meta = roomKey === '_unassigned' ? { name: 'Unassigned', floor: '', type: '' } : roomIndex.get(roomKey) || { name: 'Room', floor: '', type: '' };
+      const meta =
+        roomKey === '_unassigned'
+          ? { name: 'Unassigned', floor: '', type: '' }
+          : roomIndex.get(roomKey) || { name: 'Room', floor: '', type: '' };
       const statuses = devices.map((d) => bleSnapshots[String(d._id)]?.status || 'dead');
       const rollup = roomRollup(statuses);
-      out.push({ roomKey, meta, devices, rollup, live: statuses.filter((s) => s === 'live').length, total: devices.length });
+      out.push({
+        roomKey,
+        meta,
+        devices,
+        rollup,
+        live: statuses.filter((s) => s === 'live').length,
+        total: devices.length,
+      });
     }
     out.sort((a, b) => a.meta.name.localeCompare(b.meta.name));
     return out;
   }, [roomsGrouped, roomIndex, bleSnapshots]);
 
-  const chartData = {
-    labels: chartPoints.map((p) => (p.t ? new Date(p.t) : new Date())).map((d) =>
-      d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' })
-    ),
-    datasets: [
-      {
-        label: '°C',
-        data: chartPoints.map((p) => (typeof p.temp === 'number' && !Number.isNaN(p.temp) ? p.temp : null)),
-        borderColor: '#39B8FF',
-        backgroundColor: 'rgba(57, 184, 255, 0.15)',
-        tension: 0.25,
-        fill: true,
-        spanGaps: true,
-        pointRadius: 0,
-        borderWidth: 2,
-      },
-    ],
-  };
-
-  const chartOptions = {
-    responsive: true,
-    maintainAspectRatio: false,
-    plugins: {
-      legend: { display: false },
-      title: { display: false },
-    },
-    scales: {
-      x: {
-        ticks: { maxTicksLimit: 8, color: '#9ca3af' },
-        grid: { color: 'rgba(255,255,255,0.06)' },
-      },
-      y: {
-        ticks: { color: '#9ca3af' },
-        grid: { color: 'rgba(255,255,255,0.06)' },
-      },
-    },
-  };
+  const hasChartPoints =
+    climateGrid.temps.some((v) => typeof v === 'number') ||
+    climateGrid.hums.some((v) => typeof v === 'number');
 
   return (
     <div className="dash">
@@ -445,7 +730,7 @@ export default function DashboardPage({ onLogout }) {
 
       <section className="chart-section">
         <div className="chart-head">
-          <h2>Temperature ({CHART_HOURS}h)</h2>
+          <h2>Temperature &amp; humidity vs time</h2>
           <select value={chartBleId} onChange={(e) => setChartBleId(e.target.value)} className="chart-select">
             <option value="">Select sensor</option>
             {bles.map((d) => (
@@ -455,13 +740,77 @@ export default function DashboardPage({ onLogout }) {
             ))}
           </select>
         </div>
+        <div className="chart-controls">
+          <div className="chart-date-row">
+            <button
+              type="button"
+              className="btn-icon"
+              aria-label="Previous day"
+              onClick={() => handleDateStep(-1)}
+              disabled={chartMode === 'live'}
+            >
+              ‹
+            </button>
+            <label className="date-wrap">
+              <span>Date</span>
+              <input
+                type="date"
+                value={chartDate}
+                max={todayCalendarYmd}
+                disabled={chartMode === 'live'}
+                onChange={(e) => {
+                  const v = e.target.value;
+                  if (!v) return;
+                  const today = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
+                  setChartDate(v > today ? today : v);
+                  if (chartMode === 'live') setChartMode('24h');
+                }}
+              />
+            </label>
+            <button
+              type="button"
+              className="btn-icon"
+              aria-label="Next day"
+              onClick={() => handleDateStep(1)}
+              disabled={chartMode === 'live' || chartDate >= todayCalendarYmd}
+            >
+              ›
+            </button>
+          </div>
+          <div className="chart-mode-row">
+            <span className="mode-label">View</span>
+            <button
+              type="button"
+              className={chartMode === 'live' ? 'btn-mode active' : 'btn-mode'}
+              onClick={() => handleModeChange('live')}
+            >
+              Live
+            </button>
+            <button
+              type="button"
+              className={chartMode === '24h' ? 'btn-mode active' : 'btn-mode'}
+              onClick={() => handleModeChange('24h')}
+            >
+              24h
+            </button>
+            <button type="button" className="btn-mode outline" onClick={() => loadChart()} disabled={chartLoading}>
+              {chartLoading ? '…' : 'Reload chart'}
+            </button>
+          </div>
+        </div>
+        <p className="chart-hint">
+          Left axis = °C (auto-scaled with padding so the trace sits centered). Right = % RH (0–100). Humidity is off by
+          default — toggle it in the legend.
+        </p>
         <div className="chart-box">
           {chartLoading ? (
             <div className="chart-loading">Loading chart…</div>
-          ) : chartBleId && chartPoints.length ? (
+          ) : chartBleId && hasChartPoints ? (
             <Line data={chartData} options={chartOptions} />
           ) : (
-            <div className="chart-loading">{chartBleId ? 'No readings in this window.' : 'Select a sensor.'}</div>
+            <div className="chart-loading">
+              {chartBleId ? 'No readings in this window.' : 'Select a sensor.'}
+            </div>
           )}
         </div>
       </section>
@@ -706,8 +1055,90 @@ export default function DashboardPage({ onLogout }) {
           color: var(--cg-text);
           max-width: 100%;
         }
+        .chart-controls {
+          display: flex;
+          flex-direction: column;
+          gap: 0.5rem;
+          margin-bottom: 0.35rem;
+        }
+        .chart-date-row {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: flex-end;
+          gap: 0.35rem;
+        }
+        .btn-icon {
+          background: var(--cg-surface-2);
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          color: var(--cg-text);
+          width: 2rem;
+          height: 2rem;
+          border-radius: 8px;
+          cursor: pointer;
+          font-size: 1.1rem;
+          line-height: 1;
+          padding: 0;
+        }
+        .btn-icon:disabled {
+          opacity: 0.35;
+          cursor: not-allowed;
+        }
+        .date-wrap {
+          display: flex;
+          flex-direction: column;
+          gap: 0.15rem;
+          font-size: 0.68rem;
+          color: var(--cg-muted);
+        }
+        .date-wrap input[type='date'] {
+          padding: 0.4rem 0.5rem;
+          border-radius: 10px;
+          border: 1px solid rgba(255, 255, 255, 0.12);
+          background: var(--cg-surface-2);
+          color: var(--cg-text);
+        }
+        .date-wrap input:disabled {
+          opacity: 0.45;
+        }
+        .chart-mode-row {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 0.35rem;
+        }
+        .mode-label {
+          font-size: 0.72rem;
+          color: var(--cg-muted);
+          margin-right: 0.15rem;
+        }
+        .btn-mode {
+          background: rgba(117, 81, 255, 0.15);
+          border: 1px solid rgba(117, 81, 255, 0.35);
+          color: #e9e7ff;
+          padding: 0.35rem 0.65rem;
+          border-radius: 8px;
+          font-size: 0.75rem;
+          cursor: pointer;
+        }
+        .btn-mode.active {
+          background: rgba(117, 81, 255, 0.45);
+          border-color: rgba(117, 81, 255, 0.7);
+        }
+        .btn-mode.outline {
+          background: transparent;
+        }
+        .btn-mode:disabled {
+          opacity: 0.45;
+          cursor: not-allowed;
+        }
+        .chart-hint {
+          font-size: 0.68rem;
+          color: var(--cg-muted);
+          margin: 0 0 0.5rem;
+          line-height: 1.35;
+        }
         .chart-box {
-          height: 220px;
+          height: 280px;
           position: relative;
         }
         .chart-loading {

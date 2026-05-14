@@ -26,6 +26,46 @@ export function getHumidity(r) {
   return typeof r.hum === 'number' ? r.hum : undefined;
 }
 
+/** Min/max/avg for tooltips (matches Dashboard getTempAgg). */
+export function getTempAgg(r) {
+  if (!r) return null;
+  const t = r.temperature;
+  if (typeof t === 'number') return { min: t, max: t, avg: t };
+  if (t && typeof t === 'object') {
+    const min = typeof t.min === 'number' ? t.min : undefined;
+    const max = typeof t.max === 'number' ? t.max : undefined;
+    const avg =
+      typeof t.avg === 'number'
+        ? t.avg
+        : min != null && max != null
+          ? (min + max) / 2
+          : undefined;
+    return { min, max, avg };
+  }
+  const v = typeof r.temp === 'number' ? r.temp : undefined;
+  return typeof v === 'number' ? { min: v, max: v, avg: v } : null;
+}
+
+/** Min/max/avg for humidity tooltips (matches Dashboard getHumAgg). */
+export function getHumAgg(r) {
+  if (!r) return null;
+  const h = r.humidity;
+  if (typeof h === 'number') return { min: h, max: h, avg: h };
+  if (h && typeof h === 'object') {
+    const min = typeof h.min === 'number' ? h.min : undefined;
+    const max = typeof h.max === 'number' ? h.max : undefined;
+    const avg =
+      typeof h.avg === 'number'
+        ? h.avg
+        : min != null && max != null
+          ? (min + max) / 2
+          : undefined;
+    return { min, max, avg };
+  }
+  const v = getHumidity(r);
+  return typeof v === 'number' ? { min: v, max: v, avg: v } : null;
+}
+
 export function latestFromReadings(readings) {
   if (!Array.isArray(readings) || readings.length === 0) {
     return { temperature: null, humidity: null, timestamp: null };
