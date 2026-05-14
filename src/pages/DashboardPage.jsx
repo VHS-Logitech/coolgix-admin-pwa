@@ -36,8 +36,6 @@ const LIVE_MS = 5 * 60 * 1000;
 const STALE_MS = 2 * 60 * 60 * 1000;
 const BLE_FETCH_CONCURRENCY = 6;
 const CHART_STEP_MS = 60 * 1000;
-/** Match phones / narrow PWA layout — x-axis uses fixed hourly ticks instead of dense adaptive labels. */
-const NARROW_CHART_MEDIA = '(max-width: 640px)';
 
 function authHeaders() {
   const t = getToken();
@@ -215,17 +213,6 @@ export default function DashboardPage({ onLogout }) {
   const [chartLoading, setChartLoading] = useState(false);
   const [error, setError] = useState('');
   const [lastRefresh, setLastRefresh] = useState(null);
-  const [narrowChartViewport, setNarrowChartViewport] = useState(() =>
-    typeof window !== 'undefined' ? window.matchMedia(NARROW_CHART_MEDIA).matches : false,
-  );
-
-  useEffect(() => {
-    const mq = window.matchMedia(NARROW_CHART_MEDIA);
-    const onChange = () => setNarrowChartViewport(mq.matches);
-    onChange();
-    mq.addEventListener('change', onChange);
-    return () => mq.removeEventListener('change', onChange);
-  }, []);
 
   const roomIndex = useMemo(() => buildRoomIndex(warehouseDoc), [warehouseDoc]);
 
@@ -346,7 +333,7 @@ export default function DashboardPage({ onLogout }) {
             autoSkip: false,
             maxRotation: 0,
             color: '#9ca3af',
-            callback(value, index, ticks) {
+            callback(value) {
               const label = this.getLabelForValue(value);
               if (chartMode === 'live') {
                 const match = label.match(/^(\d{1,2}):(\d{2}):(\d{2})/);
@@ -354,7 +341,7 @@ export default function DashboardPage({ onLogout }) {
                   const hour = parseInt(match[1], 10);
                   const minute = parseInt(match[2], 10);
                   const second = parseInt(match[3], 10);
-                  if (minute % 5 === 0 && second === 0) {
+                  if (minute % 15 === 0 && second === 0) {
                     return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
                   }
                   return '';
@@ -364,30 +351,8 @@ export default function DashboardPage({ onLogout }) {
                 if (match) {
                   const hour = parseInt(match[1], 10);
                   const minute = parseInt(match[2], 10);
-                  if (narrowChartViewport) {
-                    if (minute === 0) return label;
-                    return '';
-                  }
-                  const visibleTicks = ticks.length;
-                  if (visibleTicks >= 600) {
-                    return minute === 0 && hour % 2 === 0 ? label : '';
-                  }
-                  if (visibleTicks >= 240) {
-                    return minute === 0 ? label : '';
-                  }
-                  if (visibleTicks >= 90) {
-                    return minute === 0 || minute === 30 ? label : '';
-                  }
-                  if (visibleTicks >= 45) {
-                    return minute % 15 === 0 ? label : '';
-                  }
-                  if (visibleTicks >= 25) {
-                    return minute % 5 === 0 ? label : '';
-                  }
-                  if (visibleTicks >= 12) {
-                    return minute % 2 === 0 ? label : '';
-                  }
-                  return label;
+                  if (minute === 0 && hour % 2 === 0) return label;
+                  return '';
                 }
               }
               return label;
@@ -432,7 +397,7 @@ export default function DashboardPage({ onLogout }) {
         },
       },
     }),
-    [chartMode, yAxisRangeTemp, yAxisRangeHum, narrowChartViewport],
+    [chartMode, yAxisRangeTemp, yAxisRangeHum],
   );
 
   const todayCalendarYmd = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
@@ -818,8 +783,8 @@ export default function DashboardPage({ onLogout }) {
         </div>
         <p className="chart-hint">
           Left axis = °C (auto-scaled with padding so the trace sits centered). Right = % RH (0–100). Humidity is off by
-          default — toggle it in the legend. On narrow screens, <strong>24h</strong> mode shows one x-axis label per hour
-          for readability.
+          default — toggle it in the legend. X-axis: <strong>24h</strong> shows a label every 2 hours;{' '}
+          <strong>Live</strong> every 15 minutes.
         </p>
         <div className="chart-box">
           {chartLoading ? (
