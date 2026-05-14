@@ -1,21 +1,20 @@
 import axios from 'axios';
 
 /**
- * Dev: browser calls same origin (/api/...) and Vite proxies to the backend (see vite.config.js).
- *     Override proxy target with VITE_DEV_PROXY_TARGET=http://127.0.0.1:5000
- *     To talk to a remote API in dev instead: set VITE_DEV_USE_REMOTE_API=http://host:port
- * Production:
- *   - Leave VITE_API_URL unset/empty when the static host rewrites /api → real API (e.g. Vercel
- *     vercel.json). Browser stays same-origin → no CORS.
- *   - Set VITE_API_URL only if the app origin is already allowed by the API’s CORS rules.
+ * Dev: same-origin /api/... → Vite proxy (vite.config.js). Remote in dev: VITE_DEV_USE_REMOTE_API.
+ * Production: default is same-origin /api (host rewrites to real API, e.g. vercel.json) → no CORS.
+ * Cross-origin API only if BOTH VITE_API_URL and VITE_USE_DIRECT_API=1 (API must allow your origin).
  */
 const devRemote = String(import.meta.env.VITE_DEV_USE_REMOTE_API || '').trim();
-const prodBase = String(import.meta.env.VITE_API_URL || '').trim();
+const prodConfigured = String(import.meta.env.VITE_API_URL || '').trim().replace(/\/$/, '');
+const prodUseDirectApi = ['1', 'true', 'yes'].includes(
+  String(import.meta.env.VITE_USE_DIRECT_API || '').trim().toLowerCase(),
+);
 
 if (import.meta.env.DEV) {
   axios.defaults.baseURL = devRemote || '';
-} else if (prodBase) {
-  axios.defaults.baseURL = prodBase;
+} else if (prodConfigured && prodUseDirectApi) {
+  axios.defaults.baseURL = prodConfigured;
 } else {
   axios.defaults.baseURL = '';
 }

@@ -20,9 +20,9 @@ Create `.env` in **this folder** (`coolgix-pwa-dashboard/`) only if you need non
 
 ### Production build
 
-- **Vercel (and any host that can reverse-proxy `/api`):** leave **`VITE_API_URL` unset**. The built app calls **`/api/...` on the same origin**; this repo’s `vercel.json` forwards that to `https://v2.coolgix.com`, so the browser never cross-origin calls the API and **CORS does not apply**. In the Vercel dashboard, **remove** `VITE_API_URL` if it was set, then redeploy.
-- **Why `VITE_API_URL=https://v2.coolgix.com` fails on Vercel:** the API responds with `Access-Control-Allow-Origin: https://v2.coolgix.com` only. Your page is on `https://coolgix-admin-pwa.vercel.app`, so the browser blocks the response unless the API is updated to allow that origin (or you use the proxy pattern above).
-- **Other static hosting:** set **`VITE_API_URL`** only if that host’s URL is already allowed by the backend CORS configuration.
+- **Default (Vercel, Netlify with `/api` rewrite, etc.):** the app calls **`/api/...` on the same origin**. This repo’s **`vercel.json`** forwards that to **`https://v2.coolgix.com`**, so the browser does **not** call v2 directly → **no CORS**. You can leave **`VITE_API_URL`** set in the dashboard if you want; it is **ignored** unless you also set **`VITE_USE_DIRECT_API=1`**.
+- **Cross-origin API (only if the backend CORS allowlist includes your frontend origin):** set **`VITE_API_URL`** (no trailing slash) **and** **`VITE_USE_DIRECT_API=1`**, then rebuild.
+- **Why calling v2 from `*.vercel.app` used to fail:** the API sends `Access-Control-Allow-Origin: https://v2.coolgix.com`. Your origin is different, so the browser blocks the response unless you use the same-origin `/api` proxy or the API adds your Vercel URL to CORS.
 
 ## Dev
 
