@@ -52,4 +52,4 @@ Install the app from the browser (“Add to Home screen”) after opening the bu
 
 ## Icons
 
-`public/icons/pwa-192.png` and `pwa-512.png` are minimal placeholders; replace with branded assets for store-quality install banners.
+`public/icons/pwa-192.png` and `pwa-512.png` must match the **`sizes`** in `vite.config.js` (192×192 and 512×512). The manifest is rejected if the files are the wrong dimensions. Replace these files with full-brand artwork when ready.
