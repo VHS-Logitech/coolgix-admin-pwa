@@ -24,13 +24,24 @@ import {
   buildUtcRangeForDate,
   getCalendarYmdInTimeZone,
   addCalendarDaysToYmd,
+  formatTimeInTimezone,
 } from '../timeWindow.js';
-import { buildClimateChartLabels, buildMultiSeriesUniform } from '../climateChartMulti.js';
+import {
+  CHART_24H_INTERVALS,
+  CHART_24H_DAY_MS,
+  CHART_24H_HOUR_MS,
+  CHART_24H_HOURLY_TICKS,
+  build24hHourlyAxisLabels,
+  buildClimateChartLabels,
+  buildMultiSeriesUniform,
+  chartNumericValue,
+} from '../climateChartMulti.js';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
 const BLE_FETCH_CONCURRENCY = 6;
-const CHART_STEP_MS = 60 * 1000;
+const LIVE_CHART_STEP_MS = 60 * 1000;
+const CHART_24H_INTERVAL_STORAGE_KEY = 'pwa_dash_24h_interval';
 
 function authHeaders() {
   const t = getToken();
@@ -86,48 +97,67 @@ async function mapPool(items, concurrency, mapper) {
   return results;
 }
 
-/** Smart °C axis from all plotted temperature values (matches web Dashboard). */
+/** °C axis centered on plotted data (wide room thresholds do not squash the line). */
 function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
   const allTemps = [];
   for (const ds of multiTempSeries?.datasets || []) {
-    for (const value of ds.data || []) {
-      if (typeof value === 'number' && !Number.isNaN(value)) allTemps.push(value);
+    for (const pt of ds.data || []) {
+      const value = chartNumericValue(pt);
+      if (value != null) allTemps.push(value);
     }
   }
   if (allTemps.length === 0) return null;
 
   const minTemp = Math.min(...allTemps);
   const maxTemp = Math.max(...allTemps);
-  const range = maxTemp - minTemp;
+  const dataRange = Math.max(maxTemp - minTemp, 0.5);
+  const center = (minTemp + maxTemp) / 2;
 
   let spacing;
-  if (range <= 10) {
-    spacing = 5;
-  } else if (range <= 25) {
-    spacing = 5;
-  } else if (range <= 50) {
-    spacing = 10;
+  if (dataRange <= 3) spacing = 0.5;
+  else if (dataRange <= 8) spacing = 1;
+  else if (dataRange <= 20) spacing = 2;
+  else if (dataRange <= 40) spacing = 5;
+  else spacing = 10;
+
+  const pad = Math.max(spacing * 2, dataRange * 0.25);
+  let halfSpan = dataRange / 2 + pad;
+
+  const thMin = roomConfiguration?.temperature?.min;
+  const thMax = roomConfiguration?.temperature?.max;
+  const hasThMin = typeof thMin === 'number';
+  const hasThMax = typeof thMax === 'number';
+
+  if (hasThMin && hasThMax) {
+    const thSpan = thMax - thMin;
+    if (thSpan <= dataRange * 3 + pad * 2) {
+      halfSpan = Math.max(halfSpan, thSpan / 2 + pad);
+    } else {
+      if (minTemp <= thMin + pad) halfSpan = Math.max(halfSpan, center - thMin + pad);
+      if (maxTemp >= thMax - pad) halfSpan = Math.max(halfSpan, thMax - center + pad);
+    }
   } else {
-    spacing = 20;
+    if (hasThMin && minTemp - pad <= thMin) halfSpan = Math.max(halfSpan, center - thMin + pad);
+    if (hasThMax && maxTemp + pad >= thMax) halfSpan = Math.max(halfSpan, thMax - center + pad);
   }
 
-  const paddingPercent = Math.max(0.1, Math.min(0.2, spacing / (range || 1)));
-  const padding = Math.max(spacing, range * paddingPercent);
+  let min = center - halfSpan;
+  let max = center + halfSpan;
+  if (min < 0) {
+    max -= min;
+    min = 0;
+  }
 
-  let min = Math.max(0, Math.floor((minTemp - padding) / spacing) * spacing);
-  let max = Math.ceil((maxTemp + padding) / spacing) * spacing;
-  if (min < 0) min = 0;
+  min = Math.floor(min / spacing) * spacing;
+  max = Math.ceil(max / spacing) * spacing;
 
-  if (roomConfiguration && roomConfiguration.temperature) {
-    const thresholdMin = roomConfiguration.temperature.min;
-    const thresholdMax = roomConfiguration.temperature.max;
-
-    if (typeof thresholdMin === 'number' && thresholdMin < min) {
-      min = Math.floor((thresholdMin - padding) / spacing) * spacing;
-      if (min < 0) min = 0;
-    }
-    if (typeof thresholdMax === 'number' && thresholdMax > max) {
-      max = Math.ceil((thresholdMax + padding) / spacing) * spacing;
+  if (max - min < spacing * 4) {
+    const mid = (min + max) / 2;
+    min = mid - spacing * 2;
+    max = mid + spacing * 2;
+    if (min < 0) {
+      max -= min;
+      min = 0;
     }
   }
 
@@ -154,6 +184,14 @@ export default function DashboardPage({ onLogout }) {
   const [bleReadingsMap, setBleReadingsMap] = useState({});
   const [roomConfiguration, setRoomConfiguration] = useState(null);
   const [chartMode, setChartMode] = useState('24h');
+  const [chart24hInterval, setChart24hInterval] = useState(() => {
+    try {
+      const v = localStorage.getItem(CHART_24H_INTERVAL_STORAGE_KEY);
+      return CHART_24H_INTERVALS[v] ? v : '1h';
+    } catch {
+      return '1h';
+    }
+  });
   const [chartDate, setChartDate] = useState(() => getCalendarYmdInTimeZone(new Date(), getBrowserTimeZone()));
   const [loading, setLoading] = useState(false);
   const [chartLoading, setChartLoading] = useState(false);
@@ -220,14 +258,41 @@ export default function DashboardPage({ onLogout }) {
     return arr;
   }, [bles, warehouseId, safeSelectedRoom, safeSelectedSpot]);
 
+  const chart24hPreset =
+    chartMode === '24h' ? CHART_24H_INTERVALS[chart24hInterval] || CHART_24H_INTERVALS['1h'] : null;
+  const chartStepMs = chart24hPreset?.stepMs ?? LIVE_CHART_STEP_MS;
+
   const chartTimeWindow = useMemo(() => {
     if (chartMode === '24h') {
       const range = buildUtcRangeForDate(chartDate, browserTimeZone);
-      return { startMs: range.startMs, endMs: range.endMs, startIso: range.startIso, endIso: range.endIso };
+      const preset = CHART_24H_INTERVALS[chart24hInterval] || CHART_24H_INTERVALS['1h'];
+      return {
+        startMs: range.startMs,
+        endMs: range.endMs,
+        dayEndMs: range.startMs + CHART_24H_DAY_MS,
+        pointCount: preset.points,
+        startIso: range.startIso,
+        endIso: range.endIso,
+      };
     }
     const w = getCurrentHourUtcWindow(browserTimeZone);
-    return { startMs: w.startMs, endMs: w.endMs, startIso: w.startIso, endIso: w.endIso };
-  }, [chartMode, chartDate, browserTimeZone]);
+    return {
+      startMs: w.startMs,
+      endMs: w.endMs,
+      dayEndMs: null,
+      pointCount: null,
+      startIso: w.startIso,
+      endIso: w.endIso,
+    };
+  }, [chartMode, chartDate, browserTimeZone, chart24hInterval]);
+
+  const chart24hSeriesOptions = useMemo(
+    () =>
+      chartMode === '24h'
+        ? { dataPointCount: chartTimeWindow.pointCount, useLinearTimeX: true }
+        : null,
+    [chartMode, chartTimeWindow.pointCount],
+  );
 
   useLayoutEffect(() => {
     if (chartMode !== 'live') return;
@@ -235,17 +300,18 @@ export default function DashboardPage({ onLogout }) {
     setChartDate((prev) => (prev === today ? prev : today));
   }, [chartMode, browserTimeZone]);
 
-  const climateChartLabels = useMemo(
-    () =>
-      buildClimateChartLabels(
-        chartTimeWindow.startMs,
-        chartTimeWindow.endMs,
-        CHART_STEP_MS,
-        browserTimeZone,
-        chartMode === 'live',
-      ),
-    [chartTimeWindow, browserTimeZone, chartMode],
-  );
+  const climateChartLabels = useMemo(() => {
+    if (chartMode === '24h') {
+      return build24hHourlyAxisLabels(chartTimeWindow.startMs, browserTimeZone);
+    }
+    return buildClimateChartLabels(
+      chartTimeWindow.startMs,
+      chartTimeWindow.endMs,
+      LIVE_CHART_STEP_MS,
+      browserTimeZone,
+      true,
+    );
+  }, [chartTimeWindow, browserTimeZone, chartMode]);
 
   const tempThresholds =
     roomConfiguration && roomConfiguration.temperature ? roomConfiguration.temperature : null;
@@ -258,7 +324,7 @@ export default function DashboardPage({ onLogout }) {
         bleReadingsMap,
         chartTimeWindow.startMs,
         chartTimeWindow.endMs,
-        CHART_STEP_MS,
+        chartStepMs,
         [],
         false,
         tempThresholds,
@@ -269,17 +335,21 @@ export default function DashboardPage({ onLogout }) {
         'temperature',
         true,
         climateChartLabels,
+        chart24hSeriesOptions,
       ),
     [
       visibleBleDevices,
       bleReadingsMap,
       chartTimeWindow,
+      chartStepMs,
       climateChartLabels,
+      chart24hSeriesOptions,
       tempThresholds,
       warehouseStructure,
       safeSelectedSpot,
       browserTimeZone,
       chartMode,
+      chart24hInterval,
     ],
   );
 
@@ -290,7 +360,7 @@ export default function DashboardPage({ onLogout }) {
         bleReadingsMap,
         chartTimeWindow.startMs,
         chartTimeWindow.endMs,
-        CHART_STEP_MS,
+        chartStepMs,
         [],
         false,
         humThresholds,
@@ -301,17 +371,21 @@ export default function DashboardPage({ onLogout }) {
         'humidity',
         true,
         climateChartLabels,
+        chart24hSeriesOptions,
       ),
     [
       visibleBleDevices,
       bleReadingsMap,
       chartTimeWindow,
+      chartStepMs,
       climateChartLabels,
+      chart24hSeriesOptions,
       humThresholds,
       warehouseStructure,
       safeSelectedSpot,
       browserTimeZone,
       chartMode,
+      chart24hInterval,
     ],
   );
 
@@ -346,6 +420,14 @@ export default function DashboardPage({ onLogout }) {
         title: { display: false },
         tooltip: {
           callbacks: {
+            title: (items) => {
+              const item = items[0];
+              if (!item) return '';
+              if (chartMode === '24h' && typeof item.parsed?.x === 'number') {
+                return formatTimeInTimezone(item.parsed.x, browserTimeZone, false);
+              }
+              return item.label ?? '';
+            },
             label: (ctx) => {
               const ds = ctx.dataset;
               const idx = ctx.dataIndex;
@@ -371,38 +453,44 @@ export default function DashboardPage({ onLogout }) {
         },
       },
       scales: {
-        x: {
-          grid: { display: false, color: 'rgba(255,255,255,0.06)' },
-          ticks: {
-            autoSkip: false,
-            maxRotation: 0,
-            color: '#9ca3af',
-            callback(value) {
-              const label = this.getLabelForValue(value);
-              if (chartMode === 'live') {
-                const match = label.match(/^(\d{1,2}):(\d{2}):(\d{2})/);
-                if (match) {
-                  const hour = parseInt(match[1], 10);
-                  const minute = parseInt(match[2], 10);
-                  const second = parseInt(match[3], 10);
-                  if (minute % 15 === 0 && second === 0) {
-                    return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
-                  }
-                  return '';
-                }
-              } else if (chartMode === '24h') {
-                const match = label.match(/^(\d{1,2}):(\d{2})/);
-                if (match) {
-                  const hour = parseInt(match[1], 10);
-                  const minute = parseInt(match[2], 10);
-                  if (minute === 0 && hour % 4 === 0) return label;
-                  return '';
-                }
+        x:
+          chartMode === '24h'
+            ? {
+                type: 'linear',
+                min: chartTimeWindow.startMs,
+                max: chartTimeWindow.dayEndMs,
+                grid: { display: false, color: 'rgba(255,255,255,0.06)' },
+                ticks: {
+                  autoSkip: false,
+                  maxRotation: 0,
+                  color: '#9ca3af',
+                  stepSize: CHART_24H_HOUR_MS,
+                  maxTicksLimit: CHART_24H_HOURLY_TICKS + 1,
+                  callback: (value) => formatTimeInTimezone(value, browserTimeZone, false),
+                },
               }
-              return label;
-            },
-          },
-        },
+            : {
+                grid: { display: false, color: 'rgba(255,255,255,0.06)' },
+                ticks: {
+                  autoSkip: false,
+                  maxRotation: 0,
+                  color: '#9ca3af',
+                  callback(value) {
+                    const label = this.getLabelForValue(value);
+                    const match = label.match(/^(\d{1,2}):(\d{2}):(\d{2})/);
+                    if (match) {
+                      const hour = parseInt(match[1], 10);
+                      const minute = parseInt(match[2], 10);
+                      const second = parseInt(match[3], 10);
+                      if (minute % 15 === 0 && second === 0) {
+                        return `${hour.toString().padStart(2, '0')}:${minute.toString().padStart(2, '0')}`;
+                      }
+                      return '';
+                    }
+                    return label;
+                  },
+                },
+              },
         y: {
           type: 'linear',
           position: 'left',
@@ -441,7 +529,7 @@ export default function DashboardPage({ onLogout }) {
         },
       },
     }),
-    [chartMode, yAxisRangeTemp, yAxisRangeHum],
+    [chartMode, chartTimeWindow, browserTimeZone, yAxisRangeTemp, yAxisRangeHum],
   );
 
   const todayCalendarYmd = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
@@ -702,6 +790,24 @@ export default function DashboardPage({ onLogout }) {
     }
   };
 
+  const handleChart24hIntervalChange = (interval) => {
+    if (interval === chart24hInterval || !CHART_24H_INTERVALS[interval]) return;
+    setChart24hInterval(interval);
+    try {
+      localStorage.setItem(CHART_24H_INTERVAL_STORAGE_KEY, interval);
+    } catch {
+      /* ignore */
+    }
+  };
+
+  useEffect(() => {
+    try {
+      localStorage.setItem(CHART_24H_INTERVAL_STORAGE_KEY, chart24hInterval);
+    } catch {
+      /* ignore */
+    }
+  }, [chart24hInterval]);
+
   const handleDateStep = (deltaDays) => {
     const next = addCalendarDaysToYmd(chartDate, deltaDays, browserTimeZone);
     const today = getCalendarYmdInTimeZone(new Date(), browserTimeZone);
@@ -954,17 +1060,36 @@ export default function DashboardPage({ onLogout }) {
               {chartLoading ? '…' : 'Reload chart'}
             </button>
           </div>
+          {chartMode === '24h' ? (
+            <div className="chart-interval-row">
+              <span className="mode-label">Interval</span>
+              {['1h', '30m', '15m'].map((key) => (
+                <button
+                  key={key}
+                  type="button"
+                  className={chart24hInterval === key ? 'btn-mode active' : 'btn-mode'}
+                  onClick={() => handleChart24hIntervalChange(key)}
+                >
+                  {key}
+                </button>
+              ))}
+            </div>
+          ) : null}
         </div>
         <p className="chart-hint">
           One chart: <strong>left</strong> axis = °C, <strong>right</strong> = % RH. Only the first temperature line is
-          on by default; use the legend for other BLEs, room average, and humidity. X-axis: <strong>24h</strong> every 4
-          hours; <strong>Live</strong> every 15 minutes.
+          on by default; use the legend for other BLEs, room average, and humidity. <strong>24h</strong>: 24 hourly
+          ticks on X; interval sets points (24 / 48 / 96). <strong>Live</strong>: 15-minute labels.
         </p>
         <div className="chart-box">
           {chartLoading ? (
             <div className="chart-loading">Loading chart…</div>
           ) : visibleBleDevices.length > 0 && hasChartPoints ? (
-            <Line data={chartData} options={chartOptions} />
+            <Line
+              key={`climate-${chartMode}-${chart24hInterval}-${chartDate}`}
+              data={chartData}
+              options={chartOptions}
+            />
           ) : (
             <div className="chart-loading">
               {!visibleBleDevices.length
@@ -1262,6 +1387,13 @@ export default function DashboardPage({ onLogout }) {
           flex-wrap: wrap;
           align-items: center;
           gap: 0.35rem;
+        }
+        .chart-interval-row {
+          display: flex;
+          flex-wrap: wrap;
+          align-items: center;
+          gap: 0.35rem;
+          margin-top: 0.35rem;
         }
         .mode-label {
           font-size: 0.72rem;

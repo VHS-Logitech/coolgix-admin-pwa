@@ -1,5 +1,5 @@
 /**
- * Multi-BLE climate series + room averages (ported from coolgix-frontend Dashboard.jsx).
+ * Multi-BLE climate series + room averages (aligned with coolgix-frontend Dashboard.jsx).
  */
 import {
   getReadingTimeMs,
@@ -10,6 +10,106 @@ import {
 } from './sensorHelpers.js';
 import { formatTimeInTimezone } from './timeWindow.js';
 
+export const CHART_24H_HOURLY_TICKS = 24;
+export const CHART_24H_DAY_MS = 24 * 60 * 60 * 1000;
+export const CHART_24H_HOUR_MS = 60 * 60 * 1000;
+
+/** X-axis stays 24 hourly ticks; data point count varies by interval chip. */
+export const CHART_24H_INTERVALS = {
+  '15m': { stepMs: 15 * 60 * 1000, points: 96 },
+  '30m': { stepMs: 30 * 60 * 1000, points: 48 },
+  '1h': { stepMs: 60 * 60 * 1000, points: 24 },
+};
+
+export function build24hHourlyAxisLabels(startMs, timeZone) {
+  return buildClimateChartLabels(
+    startMs,
+    startMs + CHART_24H_DAY_MS - 1,
+    CHART_24H_HOUR_MS,
+    timeZone,
+    false,
+    CHART_24H_HOURLY_TICKS,
+  );
+}
+
+export function valuesToTimeSeriesData(values, startMs, stepMs, useLinearTimeX) {
+  if (!useLinearTimeX) return values;
+  return values.map((y, i) => ({
+    x: startMs + (i + 1) * stepMs,
+    y: y == null ? null : y,
+  }));
+}
+
+export function chartNumericValue(pt) {
+  if (pt == null) return null;
+  if (typeof pt === 'number' && !Number.isNaN(pt)) return pt;
+  if (typeof pt === 'object' && typeof pt.y === 'number' && !Number.isNaN(pt.y)) return pt.y;
+  return null;
+}
+
+function breachValueInBucket(bucketEndMs, stepMs, alertIntervals, seriesMetric) {
+  if (!alertIntervals?.length) return null;
+  const bucketStart = bucketEndMs - stepMs;
+  for (let i = 0; i < alertIntervals.length; i++) {
+    const it = alertIntervals[i];
+    if (it.metric !== seriesMetric) continue;
+    if (it.breachTimestamps?.length) {
+      for (let j = 0; j < it.breachTimestamps.length; j++) {
+        const breach = it.breachTimestamps[j];
+        const ts = breach.timestamp;
+        if (ts > bucketStart && ts <= bucketEndMs) {
+          const v = breach.actualValue;
+          if (v != null && typeof v === 'number' && !Number.isNaN(v)) return v;
+        }
+      }
+    }
+  }
+  return null;
+}
+
+function hasBreachInBucket(bucketEndMs, stepMs, alertIntervals, seriesMetric) {
+  if (!alertIntervals?.length) return false;
+  const bucketStart = bucketEndMs - stepMs;
+  for (let i = 0; i < alertIntervals.length; i++) {
+    const it = alertIntervals[i];
+    if (it.metric !== seriesMetric) continue;
+    if (it.breachTimestamps?.length) {
+      for (let j = 0; j < it.breachTimestamps.length; j++) {
+        const ts = it.breachTimestamps[j].timestamp;
+        if (ts > bucketStart && ts <= bucketEndMs) return true;
+      }
+    } else {
+      const start = new Date(it.firstSeenAt || it.createdAt).getTime();
+      const end = new Date(it.lastSeenAt || it.updatedAt || it.createdAt).getTime();
+      if (end >= bucketStart && start <= bucketEndMs) return true;
+    }
+  }
+  return false;
+}
+
+function aggregateBucketReading(readings, bucketEndMs, stepMs, readValue, readMeta, getMs) {
+  const bucketStart = bucketEndMs - stepMs;
+  const values = [];
+  let lastMeta = null;
+  for (let i = 0; i < readings.length; i++) {
+    const ts = getMs(readings[i]);
+    if (ts <= bucketStart) continue;
+    if (ts > bucketEndMs) break;
+    const v = readValue(readings[i]);
+    if (v != null && typeof v === 'number' && !Number.isNaN(v)) values.push(v);
+    lastMeta = readMeta(readings[i]);
+  }
+  if (!values.length) return { value: null, info: null };
+  const min = Math.min(...values);
+  const max = Math.max(...values);
+  const avg = values.reduce((s, v) => s + v, 0) / values.length;
+  const info =
+    values.length === 1 && lastMeta
+      ? lastMeta
+      : { min, max, avg: Number(avg.toFixed(2)) };
+  return { value: Number(avg.toFixed(2)), info };
+}
+
 function calculateRoomAverage(
   bleList,
   bleIdToReadings,
@@ -19,6 +119,7 @@ function calculateRoomAverage(
   timeZone,
   readValue = getTemperature,
   precomputedLabels = null,
+  pointCountOverride = null,
 ) {
   if (bleList.length === 0) return { labels: [], data: [] };
 
@@ -33,10 +134,11 @@ function calculateRoomAverage(
   }
 
   const roomAverages = [];
-  const n = labels.length;
+  const n = pointCountOverride ?? labels.length;
 
   for (let i = 0; i < n; i++) {
-    const t = startMs + i * stepMs;
+    const bucketEnd = startMs + (i + 1) * stepMs;
+    const bucketStart = bucketEnd - stepMs;
     const validTemps = [];
 
     bleList.forEach((ble) => {
@@ -49,12 +151,12 @@ function calculateRoomAverage(
       readings.forEach((reading) => {
         const readingMs = getReadingTimeMs(reading);
         if (!Number.isFinite(readingMs)) return;
-
-        const timeDiff = Math.abs(readingMs - t);
-
-        if (timeDiff < closestTimeDiff && timeDiff <= stepMs) {
-          closestTimeDiff = timeDiff;
-          closestReading = reading;
+        if (readingMs > bucketStart && readingMs <= bucketEnd) {
+          const timeDiff = Math.abs(readingMs - bucketEnd);
+          if (timeDiff < closestTimeDiff) {
+            closestTimeDiff = timeDiff;
+            closestReading = reading;
+          }
         }
       });
 
@@ -77,8 +179,14 @@ function calculateRoomAverage(
   return { labels, data: roomAverages };
 }
 
-export function buildClimateChartLabels(startMs, endMs, stepMs, timeZone, includeSeconds) {
+export function buildClimateChartLabels(startMs, endMs, stepMs, timeZone, includeSeconds, fixedPointCount = null) {
   const labels = [];
+  if (fixedPointCount != null && fixedPointCount > 0) {
+    for (let i = 0; i < fixedPointCount; i++) {
+      labels.push(formatTimeInTimezone(startMs + i * stepMs, timeZone, includeSeconds));
+    }
+    return labels;
+  }
   for (let t = startMs; t <= endMs; t += stepMs) {
     labels.push(formatTimeInTimezone(t, timeZone, includeSeconds));
   }
@@ -87,6 +195,7 @@ export function buildClimateChartLabels(startMs, endMs, stepMs, timeZone, includ
 
 /**
  * @param {string} labelMode 'live' | '24h'
+ * @param {object|null} seriesOptions { dataPointCount, useLinearTimeX }
  */
 export function buildMultiSeriesUniform(
   bleList,
@@ -104,13 +213,17 @@ export function buildMultiSeriesUniform(
   seriesMetric = 'temperature',
   legendCollapseToFirst = true,
   precomputedLabels = null,
+  seriesOptions = null,
 ) {
   const readValue = seriesMetric === 'humidity' ? getHumidity : getTemperature;
   const readMeta = seriesMetric === 'humidity' ? getHumAgg : getTempAgg;
+  const opts = seriesOptions || {};
+  const useLinearTimeX = Boolean(opts.useLinearTimeX);
   const labels =
     precomputedLabels && precomputedLabels.length > 0
       ? precomputedLabels
       : buildClimateChartLabels(startMs, endMs, stepMs, timeZone, labelMode === 'live');
+  const dataPointCount = opts.dataPointCount ?? labels.length;
 
   const palette = [
     '#1976D2',
@@ -195,25 +308,49 @@ export function buildMultiSeriesUniform(
           const pointColors = [];
           const pointBorderColors = [];
           const color = palette[idx % palette.length];
+          const useBucketAggregate = stepMs > 60 * 1000;
 
-          for (let t = startMs; t <= endMs; t += stepMs) {
-            while (rIdx + 1 < readings.length && getMs(readings[rIdx + 1]) <= t) {
-              rIdx++;
-            }
+          for (let i = 0; i < dataPointCount; i++) {
+            const bucketEnd = startMs + (i + 1) * stepMs;
             let value = null;
             let info = null;
             let isAlert = false;
 
             if (readings.length > 0) {
-              const ts = getMs(readings[rIdx] || {});
-              if (ts > 0 && ts <= t && ts > t - stepMs) {
-                const r = readings[rIdx];
-                value = readValue(r);
-                info = readMeta(r);
-
-                if (showAlerts && seriesMetric === 'temperature' && value != null) {
-                  isAlert = isTsAlertWithValue(ts, value);
+              if (useBucketAggregate) {
+                const agg = aggregateBucketReading(readings, bucketEnd, stepMs, readValue, readMeta, getMs);
+                value = agg.value;
+                info = agg.info;
+              } else {
+                const t = bucketEnd;
+                while (rIdx + 1 < readings.length && getMs(readings[rIdx + 1]) <= t) {
+                  rIdx++;
                 }
+                const ts = getMs(readings[rIdx] || {});
+                if (ts > 0 && ts <= t && ts > t - stepMs) {
+                  const r = readings[rIdx];
+                  value = readValue(r);
+                  info = readMeta(r);
+                }
+              }
+
+              if (showAlerts && seriesMetric === 'temperature') {
+                const bucketBreach = hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+                if (bucketBreach) {
+                  isAlert = true;
+                  if (value == null) {
+                    const breachVal = breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+                    if (breachVal != null) value = breachVal;
+                  }
+                } else if (value != null) {
+                  isAlert = isTsAlertWithValue(bucketEnd, value);
+                }
+              }
+            } else if (showAlerts && seriesMetric === 'temperature') {
+              isAlert = hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+              if (isAlert && value == null) {
+                const breachVal = breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+                if (breachVal != null) value = breachVal;
               }
             }
 
@@ -238,7 +375,7 @@ export function buildMultiSeriesUniform(
           const metricTag = seriesMetric === 'humidity' ? ' · RH%' : '';
           return {
             label: `${ble.name || 'BLE'}${macTail ? ` (${macTail})` : ''}${metricTag}`,
-            data: temps,
+            data: valuesToTimeSeriesData(temps, startMs, stepMs, useLinearTimeX),
             borderColor: color,
             backgroundColor: `${color}1A`,
             tension: 0.3,
@@ -267,21 +404,31 @@ export function buildMultiSeriesUniform(
           timeZone,
           readValue,
           labels,
+          dataPointCount,
         );
         const pointBgColors = roomAverage.data.map((v, idx) => {
-          if (!showAlerts || seriesMetric !== 'temperature' || v == null) return '#FFFFFF';
-          const ts = startMs + idx * stepMs;
-          return isTsAlertWithValue(ts, v) ? '#FF1744' : '#FFFFFF';
+          if (!showAlerts || seriesMetric !== 'temperature') return '#FFFFFF';
+          const bucketEnd = startMs + (idx + 1) * stepMs;
+          if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+          if (v == null) return '#FFFFFF';
+          return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : '#FFFFFF';
         });
         const pointBorderColorsAvg = roomAverage.data.map((v, idx) => {
-          if (!showAlerts || seriesMetric !== 'temperature' || v == null) return '#FFC107';
-          const ts = startMs + idx * stepMs;
-          return isTsAlertWithValue(ts, v) ? '#FF1744' : '#FFC107';
+          if (!showAlerts || seriesMetric !== 'temperature') return '#FFC107';
+          const bucketEnd = startMs + (idx + 1) * stepMs;
+          if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+          if (v == null) return '#FFC107';
+          return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : '#FFC107';
+        });
+        const roomAvgData = roomAverage.data.map((v, idx) => {
+          if (v != null || !showAlerts || seriesMetric !== 'temperature') return v;
+          const bucketEnd = startMs + (idx + 1) * stepMs;
+          return breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric) ?? v;
         });
 
         datasets.push({
           label: seriesMetric === 'humidity' ? 'Room average · RH%' : 'Room Average',
-          data: roomAverage.data,
+          data: valuesToTimeSeriesData(roomAvgData, startMs, stepMs, useLinearTimeX),
           borderColor: '#FFC107',
           backgroundColor: '#FFC1071A',
           tension: 0.3,
@@ -347,22 +494,32 @@ export function buildMultiSeriesUniform(
             timeZone,
             readValue,
             labels,
+            dataPointCount,
           );
           const pointBgColors = roomAverage.data.map((v, idx) => {
-            if (!showAlerts || seriesMetric !== 'temperature' || v == null) return '#FFFFFF';
-            const ts = startMs + idx * stepMs;
-            return isTsAlertWithValue(ts, v) ? '#FF1744' : '#FFFFFF';
+            if (!showAlerts || seriesMetric !== 'temperature') return '#FFFFFF';
+            const bucketEnd = startMs + (idx + 1) * stepMs;
+            if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+            if (v == null) return '#FFFFFF';
+            return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : '#FFFFFF';
           });
           const pointBorderColorsRm = roomAverage.data.map((v, idx) => {
-            if (!showAlerts || seriesMetric !== 'temperature' || v == null)
+            if (!showAlerts || seriesMetric !== 'temperature')
               return roomColors[colorIndex % roomColors.length];
-            const ts = startMs + idx * stepMs;
-            return isTsAlertWithValue(ts, v) ? '#FF1744' : roomColors[colorIndex % roomColors.length];
+            const bucketEnd = startMs + (idx + 1) * stepMs;
+            if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+            if (v == null) return roomColors[colorIndex % roomColors.length];
+            return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : roomColors[colorIndex % roomColors.length];
+          });
+          const roomAvgData = roomAverage.data.map((v, idx) => {
+            if (v != null || !showAlerts || seriesMetric !== 'temperature') return v;
+            const bucketEnd = startMs + (idx + 1) * stepMs;
+            return breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric) ?? v;
           });
 
           datasets.push({
             label: seriesMetric === 'humidity' ? `${roomData.roomName} avg · RH%` : `${roomData.roomName} Average`,
-            data: roomAverage.data,
+            data: valuesToTimeSeriesData(roomAvgData, startMs, stepMs, useLinearTimeX),
             borderColor: roomColors[colorIndex % roomColors.length],
             backgroundColor: `${roomColors[colorIndex % roomColors.length]}1A`,
             tension: 0.3,
@@ -390,5 +547,5 @@ export function buildMultiSeriesUniform(
     });
   }
 
-  return { labels, datasets };
+  return { labels, datasets, useLinearTimeX };
 }
