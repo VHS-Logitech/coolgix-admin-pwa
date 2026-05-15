@@ -30,7 +30,6 @@ import {
   CHART_24H_INTERVALS,
   CHART_24H_DAY_MS,
   CHART_24H_HOUR_MS,
-  CHART_24H_HOURLY_TICKS,
   build24hHourlyAxisLabels,
   buildClimateChartLabels,
   buildMultiSeriesUniform,
@@ -42,6 +41,8 @@ ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, T
 const BLE_FETCH_CONCURRENCY = 6;
 const LIVE_CHART_STEP_MS = 60 * 1000;
 const CHART_24H_INTERVAL_STORAGE_KEY = 'pwa_dash_24h_interval';
+/** X-axis label spacing for 24h view on mobile (00:00, 04:00, …, 20:00). */
+const CHART_24H_X_TICK_MS = 4 * CHART_24H_HOUR_MS;
 
 function authHeaders() {
   const t = getToken();
@@ -464,9 +465,18 @@ export default function DashboardPage({ onLogout }) {
                   autoSkip: false,
                   maxRotation: 0,
                   color: '#9ca3af',
-                  stepSize: CHART_24H_HOUR_MS,
-                  maxTicksLimit: CHART_24H_HOURLY_TICKS + 1,
-                  callback: (value) => formatTimeInTimezone(value, browserTimeZone, false),
+                  stepSize: CHART_24H_X_TICK_MS,
+                  maxTicksLimit: 7,
+                  callback: (value) => {
+                    const ms = Number(value);
+                    if (!Number.isFinite(ms)) return '';
+                    const label = formatTimeInTimezone(ms, browserTimeZone, false);
+                    const match = label.match(/^(\d{1,2}):(\d{2})/);
+                    if (!match) return '';
+                    const hour = parseInt(match[1], 10);
+                    const minute = parseInt(match[2], 10);
+                    return minute === 0 && hour % 4 === 0 ? label : '';
+                  },
                 },
               }
             : {
@@ -1078,8 +1088,8 @@ export default function DashboardPage({ onLogout }) {
         </div>
         <p className="chart-hint">
           One chart: <strong>left</strong> axis = °C, <strong>right</strong> = % RH. Only the first temperature line is
-          on by default; use the legend for other BLEs, room average, and humidity. <strong>24h</strong>: 24 hourly
-          ticks on X; interval sets points (24 / 48 / 96). <strong>Live</strong>: 15-minute labels.
+          on by default; use the legend for other BLEs, room average, and humidity. <strong>24h</strong>: X-axis every
+          4 hours; interval sets points (24 / 48 / 96). <strong>Live</strong>: 15-minute labels.
         </p>
         <div className="chart-box">
           {chartLoading ? (
