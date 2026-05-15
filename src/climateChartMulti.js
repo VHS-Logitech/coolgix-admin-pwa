@@ -2,7 +2,7 @@
  * Multi-BLE climate series + room averages (ported from coolgix-frontend Dashboard.jsx).
  */
 import {
-  getTimestamp,
+  getReadingTimeMs,
   getTemperature,
   getHumidity,
   getTempAgg,
@@ -47,10 +47,9 @@ function calculateRoomAverage(
       let closestTimeDiff = Infinity;
 
       readings.forEach((reading) => {
-        const readingTime = getTimestamp(reading);
-        if (!readingTime) return;
+        const readingMs = getReadingTimeMs(reading);
+        if (!Number.isFinite(readingMs)) return;
 
-        const readingMs = new Date(readingTime).getTime();
         const timeDiff = Math.abs(readingMs - t);
 
         if (timeDiff < closestTimeDiff && timeDiff <= stepMs) {
@@ -184,14 +183,12 @@ export function buildMultiSeriesUniform(
       ? []
       : bleList.map((ble, idx) => {
           const readings = (bleIdToReadings[ble._id] || []).slice().sort((a, b) => {
-            const ta = getTimestamp(a);
-            const tb = getTimestamp(b);
-            return (ta ? new Date(ta).getTime() : 0) - (tb ? new Date(tb).getTime() : 0);
+            return getReadingTimeMs(a) - getReadingTimeMs(b);
           });
           let rIdx = 0;
           const getMs = (r) => {
-            const t = getTimestamp(r);
-            return t ? new Date(t).getTime() : 0;
+            const ms = getReadingTimeMs(r);
+            return Number.isFinite(ms) ? ms : 0;
           };
           const temps = [];
           const metaAgg = [];

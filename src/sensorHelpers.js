@@ -1,6 +1,39 @@
 /** Same field shapes as coolgix-frontend/src/utils/alertSensorHelpers.js */
 export function getTimestamp(r) {
-  return r?.timestamp || r?.ts || r?.createdAt || r?.time || r?.date || null;
+  if (!r || typeof r !== 'object') return null;
+  return (
+    r.timestamp ??
+    r.ts ??
+    r.createdAt ??
+    r.time ??
+    r.date ??
+    r.recordedAt ??
+    r.sampleTime ??
+    r.savedAt ??
+    null
+  );
+}
+
+/** Milliseconds for sorting / age; treats Unix seconds (< 1e12) as seconds. */
+export function getReadingTimeMs(r) {
+  const raw = getTimestamp(r);
+  if (raw == null) return NaN;
+  if (typeof raw === 'number') {
+    if (!Number.isFinite(raw)) return NaN;
+    return raw < 1e12 ? raw * 1000 : raw;
+  }
+  if (raw instanceof Date) return raw.getTime();
+  const ms = new Date(raw).getTime();
+  return Number.isNaN(ms) ? NaN : ms;
+}
+
+/** Axios body may be a bare array or wrapped ({ data, readings }). */
+export function normalizeSensorReadingsPayload(body) {
+  if (Array.isArray(body)) return body;
+  if (body && Array.isArray(body.data)) return body.data;
+  if (body && Array.isArray(body.readings)) return body.readings;
+  if (body && Array.isArray(body.results)) return body.results;
+  return [];
 }
 
 export function getTemperature(r) {
@@ -73,13 +106,14 @@ export function latestFromReadings(readings) {
   const sorted = readings
     .filter(Boolean)
     .slice()
-    .sort((a, b) => {
-      const ma = getTimestamp(a) ? new Date(getTimestamp(a)).getTime() : 0;
-      const mb = getTimestamp(b) ? new Date(getTimestamp(b)).getTime() : 0;
-      return ma - mb;
-    });
-  const latest = sorted[sorted.length - 1];
-  const ts = getTimestamp(latest);
+    .sort((a, b) => getReadingTimeMs(a) - getReadingTimeMs(b));
+  const withTime = sorted.filter((x) => Number.isFinite(getReadingTimeMs(x)));
+  const latest = withTime.length ? withTime[withTime.length - 1] : sorted[sorted.length - 1];
+  if (!latest) {
+    return { temperature: null, humidity: null, timestamp: null };
+  }
+  const ms = getReadingTimeMs(latest);
+  const ts = Number.isFinite(ms) ? new Date(ms).toISOString() : getTimestamp(latest);
   return {
     temperature: getTemperature(latest) ?? null,
     humidity: getHumidity(latest) ?? null,

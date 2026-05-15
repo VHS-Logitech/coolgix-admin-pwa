@@ -13,7 +13,7 @@ import {
 } from 'chart.js';
 import { axios, unwrap, setAuthToken } from '../api.js';
 import { clearSession, getToken, getUser } from '../session.js';
-import { latestFromReadings } from '../sensorHelpers.js';
+import { latestFromReadings, normalizeSensorReadingsPayload } from '../sensorHelpers.js';
 import {
   getBrowserTimeZone,
   getCurrentHourUtcWindow,
@@ -43,7 +43,7 @@ function companyIdFromUser(user) {
 }
 
 function ageMs(ts) {
-  if (!ts) return Infinity;
+  if (ts == null || ts === '') return Infinity;
   const ms = new Date(ts).getTime();
   if (Number.isNaN(ms)) return Infinity;
   return Date.now() - ms;
@@ -614,14 +614,24 @@ export default function DashboardPage({ onLogout }) {
       const list = Array.isArray(res.data) ? res.data : [];
       setBles(list);
 
+      const healthEnd = new Date();
+      const healthStart = new Date(healthEnd.getTime() - 48 * 60 * 60 * 1000);
+      const healthRange = {
+        start: healthStart.toISOString(),
+        end: healthEnd.toISOString(),
+      };
+
       const snaps = await mapPool(list, BLE_FETCH_CONCURRENCY, async (d) => {
         const id = d._id;
         try {
           const r = await axios.get(`/api/devices/${id}/sensor-data`, {
-            params: { limit: 120 },
+            params: {
+              ...healthRange,
+              limit: 500,
+            },
             headers: authHeaders(),
           });
-          const readings = Array.isArray(r.data) ? r.data : [];
+          const readings = normalizeSensorReadingsPayload(r.data);
           const latest = latestFromReadings(readings);
           return [String(id), { ...latest, status: streamStatus(latest.timestamp) }];
         } catch {
@@ -676,8 +686,7 @@ export default function DashboardPage({ onLogout }) {
       results.forEach((r, i) => {
         const id = ids[i];
         if (r.status === 'fulfilled') {
-          const data = Array.isArray(r.value.data) ? r.value.data : [];
-          nextMap[id] = data;
+          nextMap[id] = normalizeSensorReadingsPayload(r.value.data);
         } else {
           nextMap[id] = [];
         }
