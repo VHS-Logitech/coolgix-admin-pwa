@@ -1,4 +1,8 @@
 /** Same field shapes as coolgix-frontend/src/utils/alertSensorHelpers.js */
+
+/** Data received within this window = actively incoming (matches Alerts / Monitor). */
+export const ACTIVE_INCOMING_MS = 5 * 60 * 1000;
+
 export function getTimestamp(r) {
   if (!r || typeof r !== 'object') return null;
   return (
@@ -14,9 +18,11 @@ export function getTimestamp(r) {
   );
 }
 
-/** Milliseconds for sorting / age; treats Unix seconds (< 1e12) as seconds. */
-export function getReadingTimeMs(r) {
-  const raw = getTimestamp(r);
+/** Milliseconds for sorting / age; accepts a reading object or a raw timestamp. */
+export function getReadingTimeMs(input) {
+  if (input == null) return NaN;
+  const raw =
+    typeof input === 'object' && !(input instanceof Date) ? getTimestamp(input) : input;
   if (raw == null) return NaN;
   if (typeof raw === 'number') {
     if (!Number.isFinite(raw)) return NaN;
@@ -57,6 +63,58 @@ export function getHumidity(r) {
   }
   if (typeof r.relativeHumidity === 'number') return r.relativeHumidity;
   return typeof r.hum === 'number' ? r.hum : undefined;
+}
+
+export function isActiveIncoming(timestamp) {
+  if (timestamp == null || timestamp === '') return false;
+  const ms = getReadingTimeMs(timestamp);
+  if (!Number.isFinite(ms)) return false;
+  return Date.now() - ms <= ACTIVE_INCOMING_MS;
+}
+
+/** True if reading is outside room min/max (same as web Alerts). */
+export function readingOutsideRoomThresholds(latest, th) {
+  if (!latest || !th) return false;
+  const t = latest.temperature;
+  const h = latest.humidity;
+  const hasTemp = th.tempMin != null || th.tempMax != null;
+  const hasHum = th.humMin != null || th.humMax != null;
+  if (hasTemp) {
+    if (t == null || Number.isNaN(t)) return false;
+    if (th.tempMax != null && t > th.tempMax) return true;
+    if (th.tempMin != null && t < th.tempMin) return true;
+  }
+  if (hasHum) {
+    if (h == null || Number.isNaN(h)) return false;
+    if (th.humMax != null && h > th.humMax) return true;
+    if (th.humMin != null && h < th.humMin) return true;
+  }
+  return false;
+}
+
+/**
+ * Monitor card status: live (green) | breach (red) | offline (yellow = no active incoming data).
+ */
+export function computeBleMonitorStatus(snap, roomThresholds) {
+  if (!isActiveIncoming(snap?.timestamp)) return 'offline';
+  const th =
+    roomThresholds &&
+    (roomThresholds.tempMin != null ||
+      roomThresholds.tempMax != null ||
+      roomThresholds.humMin != null ||
+      roomThresholds.humMax != null)
+      ? roomThresholds
+      : null;
+  if (
+    th &&
+    readingOutsideRoomThresholds(
+      { temperature: snap.temperature, humidity: snap.humidity },
+      th,
+    )
+  ) {
+    return 'breach';
+  }
+  return 'live';
 }
 
 /** Min/max/avg for tooltips (matches Dashboard getTempAgg). */

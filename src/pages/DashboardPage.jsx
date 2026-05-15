@@ -13,7 +13,11 @@ import {
 } from 'chart.js';
 import { axios, unwrap, setAuthToken } from '../api.js';
 import { clearSession, getToken, getUser } from '../session.js';
-import { latestFromReadings, normalizeSensorReadingsPayload } from '../sensorHelpers.js';
+import {
+  latestFromReadings,
+  normalizeSensorReadingsPayload,
+  computeBleMonitorStatus,
+} from '../sensorHelpers.js';
 import {
   getBrowserTimeZone,
   getCurrentHourUtcWindow,
@@ -25,8 +29,6 @@ import { buildClimateChartLabels, buildMultiSeriesUniform } from '../climateChar
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
 
-const LIVE_MS = 5 * 60 * 1000;
-const STALE_MS = 2 * 60 * 60 * 1000;
 const BLE_FETCH_CONCURRENCY = 6;
 const CHART_STEP_MS = 60 * 1000;
 
@@ -42,29 +44,11 @@ function companyIdFromUser(user) {
   return '';
 }
 
-function ageMs(ts) {
-  if (ts == null || ts === '') return Infinity;
-  const ms = new Date(ts).getTime();
-  if (Number.isNaN(ms)) return Infinity;
-  return Date.now() - ms;
-}
-
-function streamStatus(ts) {
-  const age = ageMs(ts);
-  if (age === Infinity) return 'dead';
-  if (age <= LIVE_MS) return 'live';
-  if (age <= STALE_MS) return 'stale';
-  return 'dead';
-}
-
 function roomRollup(statuses) {
-  if (!statuses.length) return 'dead';
-  const lives = statuses.filter((s) => s === 'live').length;
-  const stales = statuses.filter((s) => s === 'stale').length;
-  if (lives === statuses.length) return 'live';
-  if (lives > 0) return 'mixed';
-  if (stales > 0) return 'stale';
-  return 'dead';
+  if (!statuses.length) return 'offline';
+  if (statuses.some((s) => s === 'breach')) return 'breach';
+  if (statuses.every((s) => s === 'live')) return 'live';
+  return 'offline';
 }
 
 function buildRoomIndex(warehouse) {
@@ -77,6 +61,10 @@ function buildRoomIndex(warehouse) {
           name: room.name || 'Room',
           floor: floor.name || '',
           type: room.type || '',
+          tempMin: room.temperature?.min ?? null,
+          tempMax: room.temperature?.max ?? null,
+          humMin: room.humidity?.min ?? null,
+          humMax: room.humidity?.max ?? null,
         });
       }
     }
@@ -633,9 +621,12 @@ export default function DashboardPage({ onLogout }) {
           });
           const readings = normalizeSensorReadingsPayload(r.data);
           const latest = latestFromReadings(readings);
-          return [String(id), { ...latest, status: streamStatus(latest.timestamp) }];
+          const rid = d.room ? String(d.room?._id || d.room) : '';
+          const roomTh = roomIndex.get(rid) || null;
+          const status = computeBleMonitorStatus(latest, roomTh);
+          return [String(id), { ...latest, status }];
         } catch {
-          return [String(id), { temperature: null, humidity: null, timestamp: null, status: 'dead' }];
+          return [String(id), { temperature: null, humidity: null, timestamp: null, status: 'offline' }];
         }
       });
       const map = {};
@@ -647,7 +638,7 @@ export default function DashboardPage({ onLogout }) {
       setLoading(false);
       setLastRefresh(new Date());
     }
-  }, [companyId, defaultCompanyId, warehouseId]);
+  }, [companyId, defaultCompanyId, warehouseId, roomIndex]);
 
   useEffect(() => {
     loadBleHealth();
@@ -738,7 +729,7 @@ export default function DashboardPage({ onLogout }) {
         roomKey === '_unassigned'
           ? { name: 'Unassigned', floor: '', type: '' }
           : roomIndex.get(roomKey) || { name: 'Room', floor: '', type: '' };
-      const statuses = devices.map((d) => bleSnapshots[String(d._id)]?.status || 'dead');
+      const statuses = devices.map((d) => bleSnapshots[String(d._id)]?.status || 'offline');
       const rollup = roomRollup(statuses);
       out.push({
         roomKey,
@@ -824,9 +815,9 @@ export default function DashboardPage({ onLogout }) {
       </section>
 
       <section className="legend-row">
-        <span className="pill live">Live ≤5m</span>
-        <span className="pill stale">Stale</span>
-        <span className="pill dead">No data / old</span>
+        <span className="pill live">Live · in range (≤5m)</span>
+        <span className="pill breach">Breach</span>
+        <span className="pill offline">No active data</span>
       </section>
 
       <section className="rooms">
@@ -839,9 +830,8 @@ export default function DashboardPage({ onLogout }) {
               </div>
               <div className={`room-badge roll-${card.rollup}`}>
                 {card.rollup === 'live' && 'Healthy'}
-                {card.rollup === 'mixed' && 'Partial'}
-                {card.rollup === 'stale' && 'Check'}
-                {card.rollup === 'dead' && 'Offline'}
+                {card.rollup === 'breach' && 'Out of range'}
+                {card.rollup === 'offline' && 'No active data'}
               </div>
             </div>
             <div className="room-meta">
@@ -850,7 +840,7 @@ export default function DashboardPage({ onLogout }) {
             <ul className="ble-list">
               {card.devices.map((d) => {
                 const snap = bleSnapshots[String(d._id)] || {};
-                const st = snap.status || 'dead';
+                const st = snap.status || 'offline';
                 return (
                   <li key={d._id} className={`ble-row st-${st}`}>
                     <div className="ble-name">{d.name || d.macAddress || d._id}</div>
@@ -1070,13 +1060,13 @@ export default function DashboardPage({ onLogout }) {
           border-color: rgba(34, 197, 94, 0.5);
           color: #86efac;
         }
-        .pill.stale {
-          border-color: rgba(245, 158, 11, 0.5);
-          color: #fcd34d;
-        }
-        .pill.dead {
+        .pill.breach {
           border-color: rgba(239, 68, 68, 0.45);
           color: #fecaca;
+        }
+        .pill.offline {
+          border-color: rgba(245, 158, 11, 0.5);
+          color: #fcd34d;
         }
         .rooms {
           display: flex;
@@ -1093,14 +1083,11 @@ export default function DashboardPage({ onLogout }) {
         .room-card.roll-live {
           border-left: 4px solid var(--cg-success);
         }
-        .room-card.roll-mixed {
-          border-left: 4px solid var(--cg-warning);
-        }
-        .room-card.roll-stale {
-          border-left: 4px solid var(--cg-warning);
-        }
-        .room-card.roll-dead {
+        .room-card.roll-breach {
           border-left: 4px solid var(--cg-danger);
+        }
+        .room-card.roll-offline {
+          border-left: 4px solid var(--cg-warning);
         }
         .room-head {
           display: flex;
@@ -1127,14 +1114,13 @@ export default function DashboardPage({ onLogout }) {
           background: rgba(34, 197, 94, 0.15);
           color: #86efac;
         }
-        .room-badge.roll-mixed,
-        .room-badge.roll-stale {
-          background: rgba(245, 158, 11, 0.15);
-          color: #fcd34d;
-        }
-        .room-badge.roll-dead {
+        .room-badge.roll-breach {
           background: rgba(239, 68, 68, 0.15);
           color: #fecaca;
+        }
+        .room-badge.roll-offline {
+          background: rgba(245, 158, 11, 0.15);
+          color: #fcd34d;
         }
         .room-meta {
           font-size: 0.72rem;
@@ -1162,11 +1148,11 @@ export default function DashboardPage({ onLogout }) {
         .ble-row.st-live {
           outline: 1px solid rgba(34, 197, 94, 0.35);
         }
-        .ble-row.st-stale {
-          outline: 1px solid rgba(245, 158, 11, 0.35);
+        .ble-row.st-breach {
+          outline: 1px solid rgba(239, 68, 68, 0.35);
         }
-        .ble-row.st-dead {
-          outline: 1px solid rgba(239, 68, 68, 0.3);
+        .ble-row.st-offline {
+          outline: 1px solid rgba(245, 158, 11, 0.35);
         }
         .ble-name {
           font-weight: 600;
