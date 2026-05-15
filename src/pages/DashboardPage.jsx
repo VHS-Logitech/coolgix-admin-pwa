@@ -853,7 +853,7 @@ export default function DashboardPage({ onLogout }) {
   const hasChartPoints = useMemo(() => {
     const check = (series) => {
       for (const ds of series?.datasets || []) {
-        if (ds.data?.some((v) => typeof v === 'number' && !Number.isNaN(v))) return true;
+        if (ds.data?.some((pt) => chartNumericValue(pt) != null)) return true;
       }
       return false;
     };
