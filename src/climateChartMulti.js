@@ -32,10 +32,21 @@ export function build24hHourlyAxisLabels(startMs, timeZone) {
   );
 }
 
+const CHART_BUCKET_HOUR_MS = 60 * 60 * 1000;
+
+/** Interval [bucketStart, bucketEnd]. Hourly buckets plot at start (14:15 → 14:00); finer steps at end (→ 14:15 / 14:30). */
+export function bucketBoundsForIndex(startMs, stepMs, index) {
+  const bucketStart = startMs + index * stepMs;
+  const bucketEnd = bucketStart + stepMs;
+  const plotX = stepMs >= CHART_BUCKET_HOUR_MS ? bucketStart : bucketEnd;
+  return { bucketStart, bucketEnd, plotX };
+}
+
 export function valuesToTimeSeriesData(values, startMs, stepMs, useLinearTimeX) {
   if (!useLinearTimeX) return values;
+  const plotAtBucketStart = stepMs >= CHART_BUCKET_HOUR_MS;
   return values.map((y, i) => ({
-    x: startMs + (i + 1) * stepMs,
+    x: startMs + (plotAtBucketStart ? i : i + 1) * stepMs,
     y: y == null ? null : y,
   }));
 }
@@ -47,9 +58,71 @@ export function chartNumericValue(pt) {
   return null;
 }
 
-function breachValueInBucket(bucketEndMs, stepMs, alertIntervals, seriesMetric) {
+function isValidThreshold(v) {
+  return v != null && typeof v === 'number' && !Number.isNaN(v);
+}
+
+function lineDataForY(y, { useLinearTimeX, startMs, endMs, labels }) {
+  if (useLinearTimeX) {
+    return [
+      { x: startMs, y },
+      { x: endMs, y },
+    ];
+  }
+  const n = labels?.length || 0;
+  return n > 0 ? Array.from({ length: n }, () => y) : [y];
+}
+
+function addThresholdLine(datasets, y, label, yAxisID, color, ctx) {
+  if (!isValidThreshold(y)) return;
+  datasets.push({
+    label,
+    data: lineDataForY(y, ctx),
+    yAxisID,
+    borderColor: color,
+    backgroundColor: 'transparent',
+    borderWidth: 1.5,
+    borderDash: [8, 5],
+    pointRadius: 0,
+    pointHitRadius: 0,
+    fill: false,
+    tension: 0,
+    spanGaps: true,
+    order: -1,
+    thresholdLine: true,
+  });
+}
+
+/** Room-config min/max guide lines for temperature (y) and humidity (y1). */
+export function buildThresholdLineDatasets({
+  temperature,
+  humidity,
+  startMs,
+  endMs,
+  useLinearTimeX,
+  labels,
+}) {
+  const datasets = [];
+  const ctx = { useLinearTimeX, startMs, endMs, labels };
+
+  if (temperature) {
+    addThresholdLine(datasets, temperature.min, 'Temp min limit', 'y', 'rgba(255, 152, 0, 0.95)', ctx);
+    addThresholdLine(datasets, temperature.max, 'Temp max limit', 'y', 'rgba(244, 67, 54, 0.95)', ctx);
+  }
+  if (humidity) {
+    addThresholdLine(datasets, humidity.min, 'RH min limit', 'y1', 'rgba(33, 150, 243, 0.9)', ctx);
+    addThresholdLine(datasets, humidity.max, 'RH max limit', 'y1', 'rgba(25, 118, 210, 0.9)', ctx);
+  }
+
+  return datasets;
+}
+
+export function isThresholdChartDataset(dataset) {
+  return Boolean(dataset?.thresholdLine);
+}
+
+function breachValueInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric) {
   if (!alertIntervals?.length) return null;
-  const bucketStart = bucketEndMs - stepMs;
   for (let i = 0; i < alertIntervals.length; i++) {
     const it = alertIntervals[i];
     if (it.metric !== seriesMetric) continue;
@@ -57,7 +130,7 @@ function breachValueInBucket(bucketEndMs, stepMs, alertIntervals, seriesMetric) 
       for (let j = 0; j < it.breachTimestamps.length; j++) {
         const breach = it.breachTimestamps[j];
         const ts = breach.timestamp;
-        if (ts > bucketStart && ts <= bucketEndMs) {
+        if (ts > bucketStart && ts <= bucketEnd) {
           const v = breach.actualValue;
           if (v != null && typeof v === 'number' && !Number.isNaN(v)) return v;
         }
@@ -67,34 +140,32 @@ function breachValueInBucket(bucketEndMs, stepMs, alertIntervals, seriesMetric) 
   return null;
 }
 
-function hasBreachInBucket(bucketEndMs, stepMs, alertIntervals, seriesMetric) {
+function hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric) {
   if (!alertIntervals?.length) return false;
-  const bucketStart = bucketEndMs - stepMs;
   for (let i = 0; i < alertIntervals.length; i++) {
     const it = alertIntervals[i];
     if (it.metric !== seriesMetric) continue;
     if (it.breachTimestamps?.length) {
       for (let j = 0; j < it.breachTimestamps.length; j++) {
         const ts = it.breachTimestamps[j].timestamp;
-        if (ts > bucketStart && ts <= bucketEndMs) return true;
+        if (ts > bucketStart && ts <= bucketEnd) return true;
       }
     } else {
       const start = new Date(it.firstSeenAt || it.createdAt).getTime();
       const end = new Date(it.lastSeenAt || it.updatedAt || it.createdAt).getTime();
-      if (end >= bucketStart && start <= bucketEndMs) return true;
+      if (end >= bucketStart && start <= bucketEnd) return true;
     }
   }
   return false;
 }
 
-function aggregateBucketReading(readings, bucketEndMs, stepMs, readValue, readMeta, getMs) {
-  const bucketStart = bucketEndMs - stepMs;
+function aggregateBucketReading(readings, bucketStart, bucketEnd, readValue, readMeta, getMs) {
   const values = [];
   let lastMeta = null;
   for (let i = 0; i < readings.length; i++) {
     const ts = getMs(readings[i]);
     if (ts <= bucketStart) continue;
-    if (ts > bucketEndMs) break;
+    if (ts > bucketEnd) break;
     const v = readValue(readings[i]);
     if (v != null && typeof v === 'number' && !Number.isNaN(v)) values.push(v);
     lastMeta = readMeta(readings[i]);
@@ -137,8 +208,7 @@ function calculateRoomAverage(
   const n = pointCountOverride ?? labels.length;
 
   for (let i = 0; i < n; i++) {
-    const bucketEnd = startMs + (i + 1) * stepMs;
-    const bucketStart = bucketEnd - stepMs;
+    const { bucketStart, bucketEnd } = bucketBoundsForIndex(startMs, stepMs, i);
     const validTemps = [];
 
     bleList.forEach((ble) => {
@@ -311,18 +381,18 @@ export function buildMultiSeriesUniform(
           const useBucketAggregate = stepMs > 60 * 1000;
 
           for (let i = 0; i < dataPointCount; i++) {
-            const bucketEnd = startMs + (i + 1) * stepMs;
+            const { bucketStart, bucketEnd, plotX } = bucketBoundsForIndex(startMs, stepMs, i);
             let value = null;
             let info = null;
             let isAlert = false;
 
             if (readings.length > 0) {
               if (useBucketAggregate) {
-                const agg = aggregateBucketReading(readings, bucketEnd, stepMs, readValue, readMeta, getMs);
+                const agg = aggregateBucketReading(readings, bucketStart, bucketEnd, readValue, readMeta, getMs);
                 value = agg.value;
                 info = agg.info;
               } else {
-                const t = bucketEnd;
+                const t = plotX;
                 while (rIdx + 1 < readings.length && getMs(readings[rIdx + 1]) <= t) {
                   rIdx++;
                 }
@@ -335,21 +405,21 @@ export function buildMultiSeriesUniform(
               }
 
               if (showAlerts && seriesMetric === 'temperature') {
-                const bucketBreach = hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+                const bucketBreach = hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric);
                 if (bucketBreach) {
                   isAlert = true;
                   if (value == null) {
-                    const breachVal = breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+                    const breachVal = breachValueInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric);
                     if (breachVal != null) value = breachVal;
                   }
                 } else if (value != null) {
-                  isAlert = isTsAlertWithValue(bucketEnd, value);
+                  isAlert = isTsAlertWithValue(plotX, value);
                 }
               }
             } else if (showAlerts && seriesMetric === 'temperature') {
-              isAlert = hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+              isAlert = hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric);
               if (isAlert && value == null) {
-                const breachVal = breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric);
+                const breachVal = breachValueInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric);
                 if (breachVal != null) value = breachVal;
               }
             }
@@ -408,22 +478,22 @@ export function buildMultiSeriesUniform(
         );
         const pointBgColors = roomAverage.data.map((v, idx) => {
           if (!showAlerts || seriesMetric !== 'temperature') return '#FFFFFF';
-          const bucketEnd = startMs + (idx + 1) * stepMs;
-          if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+          const { bucketStart, bucketEnd, plotX } = bucketBoundsForIndex(startMs, stepMs, idx);
+          if (hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric)) return '#FF1744';
           if (v == null) return '#FFFFFF';
-          return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : '#FFFFFF';
+          return isTsAlertWithValue(plotX, v) ? '#FF1744' : '#FFFFFF';
         });
         const pointBorderColorsAvg = roomAverage.data.map((v, idx) => {
           if (!showAlerts || seriesMetric !== 'temperature') return '#FFC107';
-          const bucketEnd = startMs + (idx + 1) * stepMs;
-          if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+          const { bucketStart, bucketEnd, plotX } = bucketBoundsForIndex(startMs, stepMs, idx);
+          if (hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric)) return '#FF1744';
           if (v == null) return '#FFC107';
-          return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : '#FFC107';
+          return isTsAlertWithValue(plotX, v) ? '#FF1744' : '#FFC107';
         });
         const roomAvgData = roomAverage.data.map((v, idx) => {
           if (v != null || !showAlerts || seriesMetric !== 'temperature') return v;
-          const bucketEnd = startMs + (idx + 1) * stepMs;
-          return breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric) ?? v;
+          const { bucketStart, bucketEnd } = bucketBoundsForIndex(startMs, stepMs, idx);
+          return breachValueInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric) ?? v;
         });
 
         datasets.push({
@@ -498,23 +568,23 @@ export function buildMultiSeriesUniform(
           );
           const pointBgColors = roomAverage.data.map((v, idx) => {
             if (!showAlerts || seriesMetric !== 'temperature') return '#FFFFFF';
-            const bucketEnd = startMs + (idx + 1) * stepMs;
-            if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+            const { bucketStart, bucketEnd, plotX } = bucketBoundsForIndex(startMs, stepMs, idx);
+            if (hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric)) return '#FF1744';
             if (v == null) return '#FFFFFF';
-            return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : '#FFFFFF';
+            return isTsAlertWithValue(plotX, v) ? '#FF1744' : '#FFFFFF';
           });
           const pointBorderColorsRm = roomAverage.data.map((v, idx) => {
             if (!showAlerts || seriesMetric !== 'temperature')
               return roomColors[colorIndex % roomColors.length];
-            const bucketEnd = startMs + (idx + 1) * stepMs;
-            if (hasBreachInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric)) return '#FF1744';
+            const { bucketStart, bucketEnd, plotX } = bucketBoundsForIndex(startMs, stepMs, idx);
+            if (hasBreachInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric)) return '#FF1744';
             if (v == null) return roomColors[colorIndex % roomColors.length];
-            return isTsAlertWithValue(bucketEnd, v) ? '#FF1744' : roomColors[colorIndex % roomColors.length];
+            return isTsAlertWithValue(plotX, v) ? '#FF1744' : roomColors[colorIndex % roomColors.length];
           });
           const roomAvgData = roomAverage.data.map((v, idx) => {
             if (v != null || !showAlerts || seriesMetric !== 'temperature') return v;
-            const bucketEnd = startMs + (idx + 1) * stepMs;
-            return breachValueInBucket(bucketEnd, stepMs, alertIntervals, seriesMetric) ?? v;
+            const { bucketStart, bucketEnd } = bucketBoundsForIndex(startMs, stepMs, idx);
+            return breachValueInBucket(bucketStart, bucketEnd, alertIntervals, seriesMetric) ?? v;
           });
 
           datasets.push({

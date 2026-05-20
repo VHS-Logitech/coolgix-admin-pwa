@@ -34,6 +34,8 @@ import {
   buildClimateChartLabels,
   buildMultiSeriesUniform,
   chartNumericValue,
+  buildThresholdLineDatasets,
+  isThresholdChartDataset,
 } from '../climateChartMulti.js';
 
 ChartJS.register(CategoryScale, LinearScale, PointElement, LineElement, Title, Tooltip, Legend, Filler);
@@ -98,21 +100,30 @@ async function mapPool(items, concurrency, mapper) {
   return results;
 }
 
-/** °C axis centered on plotted data (wide room thresholds do not squash the line). */
+/** Extra °C above max / below min threshold so limit lines sit off the plot edges. */
+const THRESHOLD_TEMP_AXIS_BUFFER = 5;
+
+/** °C axis: with min+max room limits, center on the threshold band (+ buffer); otherwise data-centric. */
 function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
   const allTemps = [];
   for (const ds of multiTempSeries?.datasets || []) {
+    if (isThresholdChartDataset(ds)) continue;
     for (const pt of ds.data || []) {
       const value = chartNumericValue(pt);
       if (value != null) allTemps.push(value);
     }
   }
-  if (allTemps.length === 0) return null;
 
-  const minTemp = Math.min(...allTemps);
-  const maxTemp = Math.max(...allTemps);
-  const dataRange = Math.max(maxTemp - minTemp, 0.5);
-  const center = (minTemp + maxTemp) / 2;
+  const thMin = roomConfiguration?.temperature?.min;
+  const thMax = roomConfiguration?.temperature?.max;
+  const hasThMin = typeof thMin === 'number' && !Number.isNaN(thMin);
+  const hasThMax = typeof thMax === 'number' && !Number.isNaN(thMax);
+
+  if (allTemps.length === 0 && !hasThMin && !hasThMax) return null;
+
+  const minTemp = allTemps.length ? Math.min(...allTemps) : null;
+  const maxTemp = allTemps.length ? Math.max(...allTemps) : null;
+  const dataRange = minTemp != null && maxTemp != null ? Math.max(maxTemp - minTemp, 0.5) : 0.5;
 
   let spacing;
   if (dataRange <= 3) spacing = 0.5;
@@ -122,28 +133,41 @@ function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
   else spacing = 10;
 
   const pad = Math.max(spacing * 2, dataRange * 0.25);
-  let halfSpan = dataRange / 2 + pad;
 
-  const thMin = roomConfiguration?.temperature?.min;
-  const thMax = roomConfiguration?.temperature?.max;
-  const hasThMin = typeof thMin === 'number';
-  const hasThMax = typeof thMax === 'number';
+  let min;
+  let max;
 
   if (hasThMin && hasThMax) {
-    const thSpan = thMax - thMin;
-    if (thSpan <= dataRange * 3 + pad * 2) {
-      halfSpan = Math.max(halfSpan, thSpan / 2 + pad);
+    const thCenter = (thMin + thMax) / 2;
+    let halfSpan = (thMax - thMin) / 2 + THRESHOLD_TEMP_AXIS_BUFFER;
+    if (minTemp != null && maxTemp != null) {
+      halfSpan = Math.max(halfSpan, thCenter - minTemp + pad);
+      halfSpan = Math.max(halfSpan, maxTemp - thCenter + pad);
+    }
+    min = thCenter - halfSpan;
+    max = thCenter + halfSpan;
+  } else if (allTemps.length === 0) {
+    if (hasThMin) {
+      min = thMin - THRESHOLD_TEMP_AXIS_BUFFER;
+      max = thMin + 12;
+    } else if (hasThMax) {
+      max = thMax + THRESHOLD_TEMP_AXIS_BUFFER;
+      min = thMax - 12;
     } else {
-      if (minTemp <= thMin + pad) halfSpan = Math.max(halfSpan, center - thMin + pad);
-      if (maxTemp >= thMax - pad) halfSpan = Math.max(halfSpan, thMax - center + pad);
+      return null;
     }
   } else {
-    if (hasThMin && minTemp - pad <= thMin) halfSpan = Math.max(halfSpan, center - thMin + pad);
-    if (hasThMax && maxTemp + pad >= thMax) halfSpan = Math.max(halfSpan, thMax - center + pad);
+    const center = (minTemp + maxTemp) / 2;
+    let halfSpan = dataRange / 2 + pad;
+    if (hasThMin) halfSpan = Math.max(halfSpan, center - (thMin - THRESHOLD_TEMP_AXIS_BUFFER));
+    if (hasThMax) halfSpan = Math.max(halfSpan, thMax + THRESHOLD_TEMP_AXIS_BUFFER - center);
+    min = center - halfSpan;
+    max = center + halfSpan;
   }
 
-  let min = center - halfSpan;
-  let max = center + halfSpan;
+  if (hasThMin) min = Math.min(min, thMin - THRESHOLD_TEMP_AXIS_BUFFER);
+  if (hasThMax) max = Math.max(max, thMax + THRESHOLD_TEMP_AXIS_BUFFER);
+
   if (min < 0) {
     max -= min;
     min = 0;
@@ -152,14 +176,25 @@ function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
   min = Math.floor(min / spacing) * spacing;
   max = Math.ceil(max / spacing) * spacing;
 
+  if (hasThMin) min = Math.min(min, Math.floor((thMin - THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
+  if (hasThMax) max = Math.max(max, Math.ceil((thMax + THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
+
   if (max - min < spacing * 4) {
     const mid = (min + max) / 2;
-    min = mid - spacing * 2;
-    max = mid + spacing * 2;
+    let widenMin = Math.min(mid - spacing * 2, min);
+    let widenMax = Math.max(mid + spacing * 2, max);
+    if (hasThMin) widenMin = Math.min(widenMin, Math.floor((thMin - THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
+    if (hasThMax) widenMax = Math.max(widenMax, Math.ceil((thMax + THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
+    min = widenMin;
+    max = widenMax;
     if (min < 0) {
       max -= min;
       min = 0;
     }
+    min = Math.floor(min / spacing) * spacing;
+    max = Math.ceil(max / spacing) * spacing;
+    if (hasThMin) min = Math.min(min, Math.floor((thMin - THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
+    if (hasThMax) max = Math.max(max, Math.ceil((thMax + THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
   }
 
   return { min, max, spacing };
@@ -400,8 +435,18 @@ export default function DashboardPage({ onLogout }) {
       yAxisID: 'y1',
       hidden: true,
     }));
-    return { labels: temp.labels, datasets: [...tempDs, ...humDs] };
-  }, [multiTempSeries, multiHumSeries]);
+    const xEnd =
+      chartMode === '24h' ? chartTimeWindow.dayEndMs ?? chartTimeWindow.endMs : chartTimeWindow.endMs;
+    const thresholdDs = buildThresholdLineDatasets({
+      temperature: roomConfiguration?.temperature ?? null,
+      humidity: roomConfiguration?.humidity ?? null,
+      startMs: chartTimeWindow.startMs,
+      endMs: xEnd,
+      useLinearTimeX: chartMode === '24h',
+      labels: temp.labels,
+    });
+    return { labels: temp.labels, datasets: [...thresholdDs, ...tempDs, ...humDs] };
+  }, [multiTempSeries, multiHumSeries, roomConfiguration, chartTimeWindow, chartMode]);
 
   const yAxisRangeTemp = useMemo(
     () => computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration),
@@ -431,6 +476,12 @@ export default function DashboardPage({ onLogout }) {
             },
             label: (ctx) => {
               const ds = ctx.dataset;
+              if (isThresholdChartDataset(ds)) {
+                const y = ctx.parsed?.y;
+                const isHum = ds.yAxisID === 'y1';
+                if (typeof y !== 'number' || Number.isNaN(y)) return '';
+                return isHum ? `Limit: ${y.toFixed(0)}% RH` : `Limit: ${y.toFixed(1)} °C`;
+              }
               const idx = ctx.dataIndex;
               const value = ctx.parsed?.y;
               const info = Array.isArray(ds.metaAgg) ? ds.metaAgg[idx] : null;
