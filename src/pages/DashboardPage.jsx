@@ -100,10 +100,14 @@ async function mapPool(items, concurrency, mapper) {
   return results;
 }
 
-/** Extra °C above max / below min threshold so limit lines sit off the plot edges. */
+/** Extra °C beyond min/max limits so those lines sit clear of the top/bottom (e.g. 8–15°C → ~3–20°C). */
 const THRESHOLD_TEMP_AXIS_BUFFER = 5;
+/** Same idea for RH% on the right axis (clamped 0–100). */
+const THRESHOLD_HUM_AXIS_BUFFER = 5;
 
-/** °C axis: with min+max room limits, center on the threshold band (+ buffer); otherwise data-centric. */
+/**
+ * °C axis: when both room limits exist, center the band (limits + buffer) on the plot; expand only to fit data.
+ */
 function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
   const allTemps = [];
   for (const ds of multiTempSeries?.datasets || []) {
@@ -123,29 +127,34 @@ function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
 
   const minTemp = allTemps.length ? Math.min(...allTemps) : null;
   const maxTemp = allTemps.length ? Math.max(...allTemps) : null;
-  const dataRange = minTemp != null && maxTemp != null ? Math.max(maxTemp - minTemp, 0.5) : 0.5;
+  const dataRange = minTemp != null && maxTemp != null ? Math.max(maxTemp - minTemp, 0.5) : null;
+  const thBandRange = hasThMin && hasThMax ? Math.max(thMax - thMin, 0.5) : null;
+  const rangeForSpacing = dataRange ?? thBandRange ?? 0.5;
 
   let spacing;
-  if (dataRange <= 3) spacing = 0.5;
-  else if (dataRange <= 8) spacing = 1;
-  else if (dataRange <= 20) spacing = 2;
-  else if (dataRange <= 40) spacing = 5;
+  if (rangeForSpacing <= 3) spacing = 0.5;
+  else if (rangeForSpacing <= 8) spacing = 1;
+  else if (rangeForSpacing <= 20) spacing = 2;
+  else if (rangeForSpacing <= 40) spacing = 5;
   else spacing = 10;
 
-  const pad = Math.max(spacing * 2, dataRange * 0.25);
+  const pad = Math.max(spacing * 2, (dataRange ?? rangeForSpacing) * 0.25);
+
+  const snapDown = (x) => Math.floor(x / spacing) * spacing;
+  const snapUp = (x) => Math.ceil(x / spacing) * spacing;
 
   let min;
   let max;
 
   if (hasThMin && hasThMax) {
-    const thCenter = (thMin + thMax) / 2;
+    const bandMid = (thMin + thMax) / 2;
     let halfSpan = (thMax - thMin) / 2 + THRESHOLD_TEMP_AXIS_BUFFER;
     if (minTemp != null && maxTemp != null) {
-      halfSpan = Math.max(halfSpan, thCenter - minTemp + pad);
-      halfSpan = Math.max(halfSpan, maxTemp - thCenter + pad);
+      halfSpan = Math.max(halfSpan, bandMid - minTemp + pad);
+      halfSpan = Math.max(halfSpan, maxTemp - bandMid + pad);
     }
-    min = thCenter - halfSpan;
-    max = thCenter + halfSpan;
+    min = bandMid - halfSpan;
+    max = bandMid + halfSpan;
   } else if (allTemps.length === 0) {
     if (hasThMin) {
       min = thMin - THRESHOLD_TEMP_AXIS_BUFFER;
@@ -158,7 +167,7 @@ function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
     }
   } else {
     const center = (minTemp + maxTemp) / 2;
-    let halfSpan = dataRange / 2 + pad;
+    let halfSpan = (dataRange ?? 0.5) / 2 + pad;
     if (hasThMin) halfSpan = Math.max(halfSpan, center - (thMin - THRESHOLD_TEMP_AXIS_BUFFER));
     if (hasThMax) halfSpan = Math.max(halfSpan, thMax + THRESHOLD_TEMP_AXIS_BUFFER - center);
     min = center - halfSpan;
@@ -173,31 +182,141 @@ function computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration) {
     min = 0;
   }
 
-  min = Math.floor(min / spacing) * spacing;
-  max = Math.ceil(max / spacing) * spacing;
+  min = snapDown(min);
+  max = snapUp(max);
+  if (hasThMin) min = Math.min(min, snapDown(thMin - THRESHOLD_TEMP_AXIS_BUFFER));
+  if (hasThMax) max = Math.max(max, snapUp(thMax + THRESHOLD_TEMP_AXIS_BUFFER));
 
-  if (hasThMin) min = Math.min(min, Math.floor((thMin - THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
-  if (hasThMax) max = Math.max(max, Math.ceil((thMax + THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
-
-  if (max - min < spacing * 4) {
-    const mid = (min + max) / 2;
-    let widenMin = Math.min(mid - spacing * 2, min);
-    let widenMax = Math.max(mid + spacing * 2, max);
-    if (hasThMin) widenMin = Math.min(widenMin, Math.floor((thMin - THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
-    if (hasThMax) widenMax = Math.max(widenMax, Math.ceil((thMax + THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
-    min = widenMin;
-    max = widenMax;
+  if (max - min < spacing * 4 && hasThMin && hasThMax) {
+    const bandMid = (thMin + thMax) / 2;
+    let h = spacing * 2;
+    min = bandMid - h;
+    max = bandMid + h;
     if (min < 0) {
       max -= min;
       min = 0;
     }
-    min = Math.floor(min / spacing) * spacing;
-    max = Math.ceil(max / spacing) * spacing;
-    if (hasThMin) min = Math.min(min, Math.floor((thMin - THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
-    if (hasThMax) max = Math.max(max, Math.ceil((thMax + THRESHOLD_TEMP_AXIS_BUFFER) / spacing) * spacing);
+    min = snapDown(min);
+    max = snapUp(max);
+    min = Math.min(min, snapDown(thMin - THRESHOLD_TEMP_AXIS_BUFFER));
+    max = Math.max(max, snapUp(thMax + THRESHOLD_TEMP_AXIS_BUFFER));
+  } else if (max - min < spacing * 4) {
+    const mid = (min + max) / 2;
+    min = mid - spacing * 2;
+    max = mid + spacing * 2;
+    if (min < 0) {
+      max -= min;
+      min = 0;
+    }
+    min = snapDown(min);
+    max = snapUp(max);
+    if (hasThMin) min = Math.min(min, snapDown(thMin - THRESHOLD_TEMP_AXIS_BUFFER));
+    if (hasThMax) max = Math.max(max, snapUp(thMax + THRESHOLD_TEMP_AXIS_BUFFER));
   }
 
   return { min, max, spacing };
+}
+
+/** RH% right axis: center band like temperature; clamp 0–100. */
+function computeHumYAxisRangeFromDatasets(multiHumSeries, roomConfiguration) {
+  const allH = [];
+  for (const ds of multiHumSeries?.datasets || []) {
+    if (isThresholdChartDataset(ds)) continue;
+    for (const pt of ds.data || []) {
+      const value = chartNumericValue(pt);
+      if (value != null) allH.push(value);
+    }
+  }
+
+  const mhMin = roomConfiguration?.humidity?.min;
+  const mhMax = roomConfiguration?.humidity?.max;
+  const hasHm = typeof mhMin === 'number' && !Number.isNaN(mhMin);
+  const hasHx = typeof mhMax === 'number' && !Number.isNaN(mhMax);
+
+  if (allH.length === 0 && !hasHm && !hasHx) return { min: 0, max: 100, spacing: 20 };
+
+  const minH = allH.length ? Math.min(...allH) : null;
+  const maxH = allH.length ? Math.max(...allH) : null;
+  const dataRange = minH != null && maxH != null ? Math.max(maxH - minH, 0.5) : null;
+  const bandRange = hasHm && hasHx ? Math.max(mhMax - mhMin, 0.5) : null;
+  const rangeForSpacing = dataRange ?? bandRange ?? 0.5;
+
+  let spacing;
+  if (rangeForSpacing <= 10) spacing = 2;
+  else if (rangeForSpacing <= 30) spacing = 5;
+  else spacing = 10;
+
+  const pad = Math.max(spacing * 2, (dataRange ?? rangeForSpacing) * 0.25);
+
+  const snapDown = (x) => Math.floor(x / spacing) * spacing;
+  const snapUp = (x) => Math.ceil(x / spacing) * spacing;
+
+  let min;
+  let max;
+
+  if (hasHm && hasHx) {
+    const bandMid = (mhMin + mhMax) / 2;
+    let halfSpan = (mhMax - mhMin) / 2 + THRESHOLD_HUM_AXIS_BUFFER;
+    if (minH != null && maxH != null) {
+      halfSpan = Math.max(halfSpan, bandMid - minH + pad);
+      halfSpan = Math.max(halfSpan, maxH - bandMid + pad);
+    }
+    min = bandMid - halfSpan;
+    max = bandMid + halfSpan;
+  } else if (allH.length === 0) {
+    if (hasHm) {
+      min = Math.max(0, mhMin - THRESHOLD_HUM_AXIS_BUFFER);
+      max = Math.min(100, mhMin + 20);
+    } else if (hasHx) {
+      max = Math.min(100, mhMax + THRESHOLD_HUM_AXIS_BUFFER);
+      min = Math.max(0, mhMax - 20);
+    } else {
+      return { min: 0, max: 100, spacing: 20 };
+    }
+  } else {
+    const center = (minH + maxH) / 2;
+    let halfSpan = (dataRange ?? 0.5) / 2 + pad;
+    if (hasHm) halfSpan = Math.max(halfSpan, center - Math.max(0, mhMin - THRESHOLD_HUM_AXIS_BUFFER));
+    if (hasHx) halfSpan = Math.max(halfSpan, Math.min(100, mhMax + THRESHOLD_HUM_AXIS_BUFFER) - center);
+    min = center - halfSpan;
+    max = center + halfSpan;
+  }
+
+  if (hasHm) min = Math.min(min, mhMin - THRESHOLD_HUM_AXIS_BUFFER);
+  if (hasHx) max = Math.max(max, mhMax + THRESHOLD_HUM_AXIS_BUFFER);
+
+  min = Math.max(0, snapDown(min));
+  max = Math.min(100, snapUp(max));
+  if (hasHm) min = Math.min(min, Math.max(0, snapDown(mhMin - THRESHOLD_HUM_AXIS_BUFFER)));
+  if (hasHx) max = Math.max(max, Math.min(100, snapUp(mhMax + THRESHOLD_HUM_AXIS_BUFFER)));
+
+  if (max - min < spacing * 4 && hasHm && hasHx) {
+    const bandMid = (mhMin + mhMax) / 2;
+    let h = spacing * 2;
+    min = Math.max(0, bandMid - h);
+    max = Math.min(100, bandMid + h);
+    min = Math.max(0, snapDown(min));
+    max = Math.min(100, snapUp(max));
+    min = Math.min(min, Math.max(0, snapDown(mhMin - THRESHOLD_HUM_AXIS_BUFFER)));
+    max = Math.max(max, Math.min(100, snapUp(mhMax + THRESHOLD_HUM_AXIS_BUFFER)));
+  } else if (max - min < spacing * 4) {
+    const mid = (min + max) / 2;
+    min = Math.max(0, mid - spacing * 2);
+    max = Math.min(100, mid + spacing * 2);
+    min = Math.max(0, snapDown(min));
+    max = Math.min(100, snapUp(max));
+    if (hasHm) min = Math.min(min, Math.max(0, snapDown(mhMin - THRESHOLD_HUM_AXIS_BUFFER)));
+    if (hasHx) max = Math.max(max, Math.min(100, snapUp(mhMax + THRESHOLD_HUM_AXIS_BUFFER)));
+  }
+
+  if (max <= min) return { min: 0, max: 100, spacing: 20 };
+
+  let tickSpacing = spacing;
+  if (max - min <= 20) tickSpacing = 5;
+  else if (max - min <= 50) tickSpacing = 10;
+  else tickSpacing = 20;
+
+  return { min, max, spacing: tickSpacing };
 }
 
 export default function DashboardPage({ onLogout }) {
@@ -452,7 +571,10 @@ export default function DashboardPage({ onLogout }) {
     () => computeTempYAxisRangeFromDatasets(multiTempSeries, roomConfiguration),
     [multiTempSeries, roomConfiguration],
   );
-  const yAxisRangeHum = useMemo(() => ({ min: 0, max: 100, spacing: 20 }), []);
+  const yAxisRangeHum = useMemo(
+    () => computeHumYAxisRangeFromDatasets(multiHumSeries, roomConfiguration),
+    [multiHumSeries, roomConfiguration],
+  );
 
   const chartData = combinedClimateChartData;
 
